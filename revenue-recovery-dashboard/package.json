@@ -1,0 +1,28 @@
+{
+  "name": "revenue-recovery-dashboard",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Frontend for the AI Revenue Recovery Platform — reads the FastAPI backend in main.py",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 5173 --strictPort",
+    "smoke": "node tests/smoke.mjs"
+  },
+  "dependencies": {
+    "lucide-react": "^0.460.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^2.13.3"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "esbuild": "^0.28.2",
+    "jsdom": "^30.0.1",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "vite": "^5.4.11"
+  }
+}

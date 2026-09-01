@@ -1,0 +1,19 @@
+# Python environment and cache
+.venv/
+.venv-1/
+__pycache__/
+*.pyc
+*.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Node / Vite frontend build artifacts
+revenue-recovery-dashboard/node_modules/
+revenue-recovery-dashboard/dist/
+.DS_Store
+
+# Secrets
+.env
