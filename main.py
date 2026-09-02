@@ -56,6 +56,7 @@ class OpportunitySummary(BaseModel):
     root_cause: Optional[str] = None
     status: str  # "undecided" | "dispatched" | "skipped"
     created_at: Optional[str] = None
+    decision_id: Optional[str] = None
 
 
 class DecisionDetail(BaseModel):
@@ -97,6 +98,12 @@ class StatsSummary(BaseModel):
     total_amount_dispatched: float
 
 
+class RootCauseBucket(BaseModel):
+    root_cause: Optional[str] = None
+    count: int
+    amount_at_risk: float
+
+
 # --- ENDPOINTS ---
 
 @app.get("/opportunities", response_model=List[OpportunitySummary])
@@ -131,6 +138,10 @@ def list_opportunities(
         if conditions:
             base_query += " WHERE " + " AND ".join(conditions)
 
+        # Dedup guard: an opportunity should have at most one decision, but
+        # nothing in the schema enforces that. If one ever gets two, this
+        # keeps the feed and its LIMIT/OFFSET paging from drifting.
+        base_query += " GROUP BY ro.opportunity_id"
         base_query += " ORDER BY ro.created_at DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
@@ -153,8 +164,38 @@ def list_opportunities(
                 root_cause=r["root_cause"],
                 status=row_status,
                 created_at=r["created_at"],
+                decision_id=r["decision_id"],
             ))
         return results
+    finally:
+        conn.close()
+
+
+@app.get("/stats/root-causes", response_model=List[RootCauseBucket])
+def stats_root_causes():
+    """Opportunity volume and value at risk, grouped by root cause, over the
+    FULL table — not a client-side sample. Added per backend-patch.py."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT COALESCE(rre.root_cause, 'unclassified') AS root_cause,
+                   COUNT(*) AS count,
+                   COALESCE(SUM(rre.amount_at_risk), 0) AS amount_at_risk
+            FROM recovery_opportunities ro
+            JOIN revenue_risk_events rre ON rre.risk_event_id = ro.revenue_risk_event_id
+            GROUP BY rre.root_cause
+            ORDER BY count DESC
+            """
+        ).fetchall()
+        return [
+            RootCauseBucket(
+                root_cause=r["root_cause"],
+                count=r["count"],
+                amount_at_risk=float(r["amount_at_risk"]),
+            )
+            for r in rows
+        ]
     finally:
         conn.close()
 

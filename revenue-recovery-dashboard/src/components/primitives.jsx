@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { AlertTriangle, Check, Copy, RefreshCw } from "lucide-react";
+import { AlertTriangle, Check, Copy, RefreshCw, ShieldAlert } from "lucide-react";
 
 /** Stark white card on the light-gray canvas. */
 export function Card({ className = "", children, ...rest }) {
@@ -66,6 +66,43 @@ export function Field({ label, children, className = "" }) {
       <dd className="mt-1 text-[13px] font-medium leading-snug text-ink-900">
         {children}
       </dd>
+    </div>
+  );
+}
+
+/**
+ * "Why was this flagged" explanation, shared by every screen that shows a
+ * requires_human_review decision (DecisionPanel and ReviewQueue). Living in
+ * one place means fixing the copy fixes it everywhere it's shown, instead
+ * of the two screens silently drifting apart.
+ *
+ * Most requires_human_review rows are legitimate judgement calls (recovery
+ * likelihood too uncertain to decide automatically) inherited from the
+ * original dataset — a much smaller number are genuine data-integrity
+ * errors (a customer/merchant reference pointing at nothing) raised by the
+ * agent itself. The copy differs because the two are not the same kind of
+ * problem.
+ */
+export function FlaggedNotice({ recommendedAction }) {
+  const isDataIntegrityError = recommendedAction === "data_integrity_error";
+  return (
+    <div className="flex items-start gap-3 rounded-md border border-amber-200 bg-reviewBg p-3.5">
+      <ShieldAlert
+        size={16}
+        className="mt-0.5 shrink-0 text-review"
+        strokeWidth={2.25}
+        aria-hidden="true"
+      />
+      <div>
+        <p className="text-[13px] font-semibold text-ink-900">
+          Flagged for a person
+        </p>
+        <p className="mt-1 max-w-[62ch] text-[13px] leading-relaxed text-ink-600">
+          {isDataIntegrityError
+            ? "The agent stopped because a customer or merchant reference on this opportunity points at nothing — a data problem, not a judgement call."
+            : "The agent stopped rather than acting on its own. This is a genuine judgement call — recovery likelihood was too uncertain to decide automatically — not an error."}
+        </p>
+      </div>
     </div>
   );
 }

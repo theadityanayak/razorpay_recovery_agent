@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { ChevronDown, ShieldCheck } from "lucide-react";
-import { Card, CardHeader, EmptyState, ErrorState, IdChip, Skeleton } from "./primitives";
+import { Card, CardHeader, EmptyState, ErrorState, FlaggedNotice, IdChip, Skeleton } from "./primitives";
 import MessagePanel from "./MessagePanel";
 import PipelineStepper, { buildStages } from "./PipelineStepper";
 import { Field, Pill } from "./primitives";
@@ -23,7 +23,7 @@ export default function ReviewQueue({ refreshToken, onBack }) {
     <Card>
       <CardHeader
         title="Decisions the agent flagged"
-        subtitle="An empty queue is the good state — it means nothing needed a person. Flags here are mostly data-integrity problems, such as a customer or merchant reference that points at nothing."
+        subtitle="An empty queue is the good state — it means nothing needed a person. Most flags here are genuine judgement calls the agent wasn't confident enough to make on its own; a smaller number are data-integrity problems, like a customer or merchant reference that points at nothing."
         actions={
           onBack ? (
             <button
@@ -100,6 +100,8 @@ export default function ReviewQueue({ refreshToken, onBack }) {
                     id={panelId}
                     className="animate-expandDown space-y-5 border-l-2 border-review bg-canvas px-5 py-6 sm:px-6"
                   >
+                    <FlaggedNotice recommendedAction={decision.recommended_action} />
+
                     <div className="rounded-md border border-hairline bg-white px-4 py-5 sm:px-6">
                       <PipelineStepper stages={buildStages({ decision, opportunity: null })} />
                     </div>

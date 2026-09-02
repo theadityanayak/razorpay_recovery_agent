@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
-import { Clock3, GitBranch, ShieldAlert } from "lucide-react";
+import { Clock3, GitBranch } from "lucide-react";
 import PipelineStepper, { buildStages } from "./PipelineStepper";
 import MessagePanel from "./MessagePanel";
-import { ErrorState, Field, IdChip, Pill, Skeleton } from "./primitives";
+import { ErrorState, Field, FlaggedNotice, IdChip, Pill, Skeleton } from "./primitives";
 import { resolveDecision } from "../api/decisionIndex";
 import {
   actionLabel,
@@ -106,25 +106,7 @@ export default function DecisionPanel({ opportunity }) {
   return (
     <div className="space-y-5">
       {decision.requires_human_review ? (
-        <div className="flex items-start gap-3 rounded-md border border-amber-200 bg-reviewBg p-3.5">
-          <ShieldAlert
-            size={16}
-            className="mt-0.5 shrink-0 text-review"
-            strokeWidth={2.25}
-            aria-hidden="true"
-          />
-          <div>
-            <p className="text-[13px] font-semibold text-ink-900">
-              Flagged for a person
-            </p>
-            <p className="mt-1 max-w-[62ch] text-[13px] leading-relaxed text-ink-600">
-              The agent stopped rather than acting on its own. Flags in this
-              dataset are usually data-integrity problems — a customer or
-              merchant reference that points at nothing — rather than close
-              judgement calls.
-            </p>
-          </div>
-        </div>
+        <FlaggedNotice recommendedAction={decision.recommended_action} />
       ) : null}
 
       {/* The pipeline is the anchor of this panel: it answers "what did the

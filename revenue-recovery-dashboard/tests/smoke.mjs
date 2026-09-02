@@ -119,9 +119,59 @@ const MESSAGES = {
   },
 };
 
+// Two requires_human_review=true cases. These are NOT the same kind of
+// problem, and the UI must say so differently for each — this is what was
+// silently wrong until it was caught by eye, not by any test:
+//   1. A genuine data-integrity error the agent itself raised.
+//   2. A legitimate judgement call inherited from the original dataset
+//      (the far more common case in practice — 500+ rows in real data
+//      against a couple of data-integrity errors).
+const FLAGGED_DECISIONS = [
+  {
+    decision_id: "flag0001-int3-grty-erro-r00000000001",
+    recovery_opportunity_id: "flagopp1-0000-0000-0000-000000000001",
+    risk_assessment: "data_integrity_error",
+    recommended_action: "data_integrity_error",
+    confidence_score: null,
+    reasoning_summary:
+      "Dangling reference on opportunity flagopp1-0000-0000-0000-000000000001: customer_id=ffffffff-0000-0000-0000-000000000000 not found.",
+    policy_check_result: "blocked",
+    requires_human_review: true,
+    decided_at: "2026-09-01T06:00:00.000Z",
+    action_status: "skipped",
+    action_failure_reason:
+      "Dangling reference on opportunity flagopp1-0000-0000-0000-000000000001: customer_id=ffffffff-0000-0000-0000-000000000000 not found.",
+    customer_id: "ffffffff-0000-0000-0000-000000000000",
+    merchant_id: "2f6f2caa-eb5f-405c-83ea-60f56bb43862",
+    merchant_name: "GhostMerchant",
+    amount_at_risk: 3000,
+  },
+  {
+    decision_id: "flag0002-judg-emen-tcal-l00000000002",
+    recovery_opportunity_id: "flagopp2-0000-0000-0000-000000000002",
+    risk_assessment: "moderate_recovery_likelihood",
+    recommended_action: "escalate_to_human",
+    confidence_score: 0.46,
+    reasoning_summary:
+      "Assessed as moderate_recovery_likelihood (p=0.46); action=escalate_to_human; policy_check=passed",
+    policy_check_result: "passed",
+    requires_human_review: true,
+    decided_at: "2026-08-15T09:30:00.000Z",
+    action_status: null,
+    action_failure_reason: "",
+    customer_id: "cccc3333-0000-4000-8000-000000000003",
+    merchant_id: "8efd31fe-54dd-4c30-be2e-5b4a73c6e529",
+    merchant_name: "EduVriksha Learning",
+    amount_at_risk: 3810.4,
+  },
+];
+
 /* ── Mock transport ──────────────────────────────────────────────────────── */
 
 const calls = [];
+// Toggled mid-run: proves both the empty-queue good-state AND the
+// populated queue with real flagged rows, in one test run.
+let reviewQueueMode = "empty";
 
 function json(body, status = 200) {
   return Promise.resolve({
@@ -167,7 +217,9 @@ function mockFetch(url) {
   if (path.startsWith("/decisions")) {
     const params = new URLSearchParams(path.split("?")[1] || "");
     const offset = Number(params.get("offset") || 0);
-    if (params.get("requires_human_review") === "true") return json([]);
+    if (params.get("requires_human_review") === "true") {
+      return json(offset > 0 ? [] : reviewQueueMode === "flagged" ? FLAGGED_DECISIONS : []);
+    }
     return json(offset > 0 ? [] : DECISIONS);
   }
 
@@ -353,6 +405,58 @@ check("empty review queue reads as good", text().includes("Nothing needs review"
 check(
   "review filter sent to API",
   calls.some((c) => c.includes("requires_human_review=true"))
+);
+
+// Switch the mock to return real flagged rows, then use the app's own
+// Refresh button so this exercises the real refresh path, not a re-render
+// shortcut.
+reviewQueueMode = "flagged";
+const refreshBtn = [...document.querySelectorAll("button")].find((b) =>
+  (b.textContent || "").includes("Refresh")
+);
+await act(async () => {
+  refreshBtn?.click();
+});
+await settle(200);
+
+check("flagged rows appear after refresh", text().includes("GhostMerchant") && text().includes("EduVriksha Learning"));
+
+const reviewRowButtons = () =>
+  [...document.querySelectorAll("button[aria-expanded]")].filter((b) =>
+    (b.getAttribute("aria-controls") || "").startsWith("review-")
+  );
+
+// Row 1: the genuine data-integrity error.
+await act(async () => {
+  reviewRowButtons()[0]?.click();
+});
+await settle(150);
+check(
+  "data-integrity flag gets the data-problem explanation",
+  text().includes("a customer or merchant reference on this opportunity points at nothing")
+);
+check(
+  "data-integrity flag does NOT get the judgement-call explanation",
+  !text().includes("recovery likelihood was too uncertain to decide automatically")
+);
+
+// Row 2: the legitimate judgement call — close it first so both panels
+// aren't open and bleeding into each other's text() check.
+await act(async () => {
+  reviewRowButtons()[0]?.click();
+});
+await settle(80);
+await act(async () => {
+  reviewRowButtons()[1]?.click();
+});
+await settle(150);
+check(
+  "judgement-call flag gets the judgement-call explanation",
+  text().includes("recovery likelihood was too uncertain to decide automatically")
+);
+check(
+  "judgement-call flag does NOT get the data-problem explanation",
+  !text().includes("a customer or merchant reference on this opportunity points at nothing")
 );
 
 /* ── Result ──────────────────────────────────────────────────────────────── */
