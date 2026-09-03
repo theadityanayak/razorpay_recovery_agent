@@ -5,28 +5,52 @@
 @layer base {
   html {
     -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
   }
 
   body {
     @apply bg-canvas text-ink-900 font-sans antialiased;
-  }
-
-  /* Every number in this product is money or a count that gets scanned
-     down a column, so figures are tabular everywhere by default. */
-  body {
+    /* Every number here is money or a count read down a column, so figures
+       are tabular by default and never jitter as they animate. */
     font-variant-numeric: tabular-nums;
   }
 
-  /* A visible, high-contrast focus ring — the dashboard is keyboard
-     navigable end to end, including expanding table rows. */
+  /* Headings sit tighter than body copy at every size. Plus Jakarta Sans is
+     wide by default; without this the metric figures look loose. */
+  h1,
+  h2,
+  h3 {
+    @apply tracking-tight;
+  }
+
+  /* Soft brand halo, no ring-offset.
+     An offset ring has to pick a colour, and whichever one it picks is wrong
+     on the other surface — a canvas-grey halo on a white card, or a white
+     halo on the canvas. A wider, lower-opacity ring with no offset reads
+     correctly on both, which matters because focusable elements here sit on
+     white cards, on the grey canvas, and inside tinted wells. */
   :focus-visible {
-    @apply outline-none ring-2 ring-brand ring-offset-2 ring-offset-white rounded-[3px];
+    @apply outline-none ring-[3px] ring-brand/40 rounded-xl;
   }
 
   ::selection {
-    background-color: #d6ecfe;
-    color: #012652;
+    background-color: #dbeeff;
+    color: #0b1b33;
+  }
+}
+
+@layer components {
+  /* The one shared shape in the system. Cards are white, borderless, and
+     separated from the canvas by shadow alone. */
+  .card-float {
+    @apply rounded-3xl bg-surface shadow-float;
+  }
+
+  /* Inset well used inside a card — one step darker than the card, one step
+     lighter than the canvas, and one radius step tighter than its parent. */
+  .well {
+    @apply rounded-2xl bg-subtle;
   }
 }
 
@@ -36,7 +60,7 @@
     width: 8px;
   }
   .scrollbar-slim::-webkit-scrollbar-thumb {
-    background-color: #d3dbe5;
+    background-color: #dde3ec;
     border-radius: 99px;
   }
   .scrollbar-slim::-webkit-scrollbar-track {
@@ -46,7 +70,7 @@
   .skeleton {
     position: relative;
     overflow: hidden;
-    background-color: #e9edf3;
+    background-color: #eef1f5;
   }
   .skeleton::after {
     content: "";
@@ -56,10 +80,10 @@
     background-image: linear-gradient(
       90deg,
       rgba(255, 255, 255, 0) 0,
-      rgba(255, 255, 255, 0.65) 50%,
+      rgba(255, 255, 255, 0.7) 50%,
       rgba(255, 255, 255, 0) 100%
     );
-    animation: shimmer 1.4s infinite;
+    animation: shimmer 1.5s infinite;
   }
 
   @keyframes shimmer {
@@ -69,8 +93,8 @@
   }
 }
 
-/* Respect the OS setting. The count-ups and the pipeline reveal are the
-   only motion in the product; both are switched off here. */
+/* Respect the OS setting. The count-ups and the pipeline reveal are the only
+   non-user-triggered motion in the product; both are switched off here. */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

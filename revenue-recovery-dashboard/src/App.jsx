@@ -49,7 +49,12 @@ export default function App() {
         onClose={() => setMenuOpen(false)}
       />
 
-      <div className="lg:pl-64">
+      {/*
+        The rail is 248px; the content column is inset a further 8px so the
+        cards' shadows have somewhere to fall. Gaps step up from the old 20px
+        to 28px — on a screen this dense, spacing is the whole redesign.
+      */}
+      <div className="lg:pl-[248px]">
         <TopBar
           view={view}
           onOpenMenu={() => setMenuOpen(true)}
@@ -57,7 +62,7 @@ export default function App() {
           refreshedAt={refreshedAt}
         />
 
-        <main className="mx-auto max-w-[1500px] space-y-5 px-4 py-6 sm:px-6">
+        <main className="mx-auto max-w-[1480px] space-y-7 px-5 pb-10 pt-4 sm:px-8">
           {view === "overview" ? (
             <>
               <StatsHeader
@@ -67,7 +72,7 @@ export default function App() {
                 onRetry={reloadStats}
               />
 
-              <div className="grid grid-cols-1 gap-5 xl:grid-cols-[1.6fr_1fr]">
+              <div className="grid grid-cols-1 gap-7 xl:grid-cols-[1.6fr_1fr]">
                 <RootCauseChart refreshToken={refreshToken} />
                 <OutcomeDonut
                   stats={stats}
@@ -98,9 +103,9 @@ export default function App() {
             <ReviewQueue refreshToken={refreshToken} onBack={() => navigate("overview")} />
           ) : null}
 
-          <footer className="pt-2 pb-6 text-2xs leading-relaxed text-ink-400">
-            Razorpay-inspired palette, used as a visual reference only. This
-            project is not affiliated with or endorsed by Razorpay.
+          <footer className="px-1 pt-1 text-2xs leading-relaxed text-ink-400">
+            Razorpay branding and palette are used here as a visual placeholder
+            only. This project is not affiliated with or endorsed by Razorpay.
           </footer>
         </main>
       </div>

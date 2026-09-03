@@ -1,13 +1,74 @@
 import { useState } from "react";
 import { ChevronDown, ShieldCheck } from "lucide-react";
-import { Card, CardHeader, EmptyState, ErrorState, FlaggedNotice, IdChip, Skeleton } from "./primitives";
+import {
+  Card,
+  CardHeader,
+  EmptyState,
+  ErrorState,
+  Field,
+  FlaggedNotice,
+  IdChip,
+  RawDisclosure,
+  ReasonBadge,
+  Skeleton,
+} from "./primitives";
 import MessagePanel from "./MessagePanel";
 import PipelineStepper, { buildStages } from "./PipelineStepper";
-import { Field, Pill } from "./primitives";
 import { api } from "../api/client";
 import { useApi } from "../hooks/useApi";
-import { actionLabel, riskLabel } from "../lib/labels";
+import { actionLabel } from "../lib/labels";
+import { parseReasoning } from "../lib/reasoning";
 import { formatDateTime, formatINR, formatPercent } from "../lib/format";
+
+/**
+ * The row summary used to print `reasoning_summary` verbatim, so an ops user
+ * scanning this queue read:
+ *
+ *   Assessed as moderate_recovery_likelihood (p=0.46); action=escalate_to_human
+ *
+ * That is a log line. It's now parsed into badges by `lib/reasoning`, and the
+ * probability is dropped from the row entirely — it survives in the expanded
+ * panel, where there's room to say what it actually measures. The untouched
+ * original is still one click away under "Raw agent output".
+ */
+function RowBadges({ decision, only }) {
+  const { badges } = parseReasoning(decision.reasoning_summary, decision);
+  // Select by id, never by slice. The collapsed row shows outlook + policy on
+  // the left and the action on the right; slicing the first N would have put
+  // the action badge in both places.
+  const shown = only ? badges.filter((b) => only.includes(b.id)) : badges;
+  if (shown.length === 0) return null;
+  return (
+    <span className="flex flex-wrap items-center gap-1.5">
+      {shown.map((badge) => (
+        <ReasonBadge key={badge.id} badge={badge} />
+      ))}
+    </span>
+  );
+}
+
+/**
+ * Confidence, shown as a meter rather than a bare "p=0.46".
+ *
+ * Deliberately monochrome: colour-coding a low score red would read as "the
+ * agent got it wrong", when low confidence on an unrecoverable payment is the
+ * agent being correctly pessimistic.
+ */
+function ConfidenceMeter({ score }) {
+  if (score === null || score === undefined) return <span className="text-ink-300">Not scored</span>;
+  const pct = Math.max(0, Math.min(1, score));
+  return (
+    <span
+      className="flex items-center gap-2.5"
+      title="How sure the agent was about its own assessment. It is a model score, not a probability that the payment will recover."
+    >
+      <span className="h-1.5 w-16 overflow-hidden rounded-full bg-subtle">
+        <span className="block h-full rounded-full bg-navy-900" style={{ width: `${pct * 100}%` }} />
+      </span>
+      <span className="text-[13px] font-bold">{formatPercent(pct, 0)}</span>
+    </span>
+  );
+}
 
 export default function ReviewQueue({ refreshToken, onBack }) {
   const [openId, setOpenId] = useState(null);
@@ -20,16 +81,16 @@ export default function ReviewQueue({ refreshToken, onBack }) {
   const rows = data ?? [];
 
   return (
-    <Card>
+    <Card className="overflow-hidden">
       <CardHeader
         title="Decisions the agent flagged"
-        subtitle="An empty queue is the good state — it means nothing needed a person. Most flags here are genuine judgement calls the agent wasn't confident enough to make on its own; a smaller number are data-integrity problems, like a customer or merchant reference that points at nothing."
+        subtitle="An empty queue is the good state — it means nothing needed a person. Most flags here are judgement calls the agent wasn't confident enough to make alone; a smaller number are data problems, like a customer reference that points at nothing."
         actions={
           onBack ? (
             <button
               type="button"
               onClick={onBack}
-              className="rounded-md border border-hairline bg-white px-2.5 py-1.5 text-xs font-semibold text-ink-900 hover:bg-canvas"
+              className="rounded-full bg-subtle px-4 py-2 text-xs font-bold text-ink-700 transition-colors hover:bg-brand-50 hover:text-brand-700"
             >
               Back to overview
             </button>
@@ -38,13 +99,13 @@ export default function ReviewQueue({ refreshToken, onBack }) {
       />
 
       {error ? (
-        <div className="p-5">
+        <div className="p-7 pt-5">
           <ErrorState error={error} onRetry={reload} />
         </div>
       ) : loading ? (
-        <div className="space-y-3 p-5">
+        <div className="space-y-3 p-7 pt-5">
           {Array.from({ length: 3 }).map((_, i) => (
-            <Skeleton key={i} className="h-16 w-full rounded-md" />
+            <Skeleton key={i} className="h-[72px] w-full rounded-2xl" />
           ))}
         </div>
       ) : rows.length === 0 ? (
@@ -53,12 +114,24 @@ export default function ReviewQueue({ refreshToken, onBack }) {
           decisions will appear here as soon as one is raised.
         </EmptyState>
       ) : (
-        <ul className="divide-y divide-hairline">
+        <ul className="space-y-2.5 p-4 pt-5 sm:p-5 sm:pt-5">
           {rows.map((decision) => {
             const isOpen = openId === decision.decision_id;
             const panelId = `review-${decision.decision_id}`;
+            const parsed = parseReasoning(decision.reasoning_summary, decision);
+
             return (
-              <li key={decision.decision_id}>
+              /*
+                Each row is its own soft card rather than a divided list item.
+                Dividers between rows in a queue this short add three hairlines
+                and no information; a gap does the same job silently.
+              */
+              <li
+                key={decision.decision_id}
+                className={`overflow-hidden rounded-2xl transition-colors ${
+                  isOpen ? "bg-subtle" : "bg-surface"
+                }`}
+              >
                 <button
                   type="button"
                   onClick={() =>
@@ -66,29 +139,29 @@ export default function ReviewQueue({ refreshToken, onBack }) {
                   }
                   aria-expanded={isOpen}
                   aria-controls={panelId}
-                  className={`flex w-full items-center gap-4 px-5 py-4 text-left transition-colors ${
-                    isOpen ? "bg-reviewBg" : "hover:bg-canvas"
+                  className={`flex w-full items-center gap-4 rounded-2xl px-4 py-4 text-left transition-colors sm:px-5 ${
+                    isOpen ? "bg-subtle" : "hover:bg-subtle"
                   }`}
                 >
-                  <span className="h-8 w-1 shrink-0 rounded-full bg-review" aria-hidden="true" />
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-[13px] font-semibold text-ink-900">
+                    <span className="block truncate text-[14px] font-bold text-ink-900">
                       {decision.merchant_name || "Unknown merchant"}
                     </span>
-                    <span className="mt-0.5 block truncate text-xs text-ink-400">
-                      {decision.reasoning_summary || "No reasoning recorded"}
+                    {/* Badges replace the raw string that used to sit here. */}
+                    <span className="mt-2 flex flex-wrap items-center gap-1.5">
+                      <RowBadges decision={decision} only={["outlook", "policy"]} />
                     </span>
                   </span>
-                  <span className="hidden shrink-0 text-[13px] font-semibold text-ink-900 sm:block">
+                  <span className="hidden shrink-0 text-[14px] font-bold text-ink-900 sm:block">
                     {formatINR(decision.amount_at_risk)}
                   </span>
-                  <Pill tone="review" className="hidden shrink-0 md:inline-flex">
-                    {actionLabel(decision.recommended_action)}
-                  </Pill>
+                  <span className="hidden shrink-0 md:block">
+                    <RowBadges decision={decision} only={["action"]} />
+                  </span>
                   <ChevronDown
                     size={16}
-                    strokeWidth={2.25}
-                    className={`shrink-0 text-ink-400 transition-transform duration-150 ${
+                    strokeWidth={2.5}
+                    className={`shrink-0 text-ink-400 transition-transform duration-200 ${
                       isOpen ? "rotate-180" : ""
                     }`}
                     aria-hidden="true"
@@ -98,30 +171,46 @@ export default function ReviewQueue({ refreshToken, onBack }) {
                 {isOpen ? (
                   <div
                     id={panelId}
-                    className="animate-expandDown space-y-5 border-l-2 border-review bg-canvas px-5 py-6 sm:px-6"
+                    className="animate-expandDown space-y-6 px-4 pb-6 pt-2 sm:px-5"
                   >
                     <FlaggedNotice recommendedAction={decision.recommended_action} />
 
-                    <div className="rounded-md border border-hairline bg-white px-4 py-5 sm:px-6">
+                    <div className="rounded-2xl bg-surface px-5 py-6 shadow-soft sm:px-7">
                       <PipelineStepper stages={buildStages({ decision, opportunity: null })} />
                     </div>
 
-                    <dl className="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-3 lg:grid-cols-5">
-                      <Field label="Recovery outlook">{riskLabel(decision.risk_assessment)}</Field>
+                    {/* Full badge set, including the policy check. */}
+                    <div className="flex flex-wrap items-center gap-2">
+                      <RowBadges decision={decision} />
+                    </div>
+
+                    <dl className="grid grid-cols-2 gap-x-6 gap-y-5 sm:grid-cols-3 lg:grid-cols-4">
                       <Field label="Confidence">
-                        {formatPercent(decision.confidence_score ?? 0, 0)}
+                        <ConfidenceMeter score={decision.confidence_score} />
                       </Field>
                       <Field label="Chosen action">{actionLabel(decision.recommended_action)}</Field>
-                      <Field label="Policy check">{decision.policy_check_result || "—"}</Field>
                       <Field label="Decided">{formatDateTime(decision.decided_at)}</Field>
+                      <Field label="Amount at risk">{formatINR(decision.amount_at_risk)}</Field>
                     </dl>
 
-                    {decision.action_failure_reason ? (
+                    {/* Free-prose reasoning — a data fault the agent described
+                        in a real sentence — is shown as written. Only the
+                        structured log lines get parsed away. */}
+                    {parsed.narrative ? (
+                      <Field label="What the agent reported">
+                        <span className="font-medium leading-relaxed text-ink-700">
+                          {parsed.narrative}
+                        </span>
+                      </Field>
+                    ) : null}
+
+                    {decision.action_failure_reason &&
+                    decision.action_failure_reason !== parsed.narrative ? (
                       <Field label="Why it stopped">{decision.action_failure_reason}</Field>
                     ) : null}
 
-                    <div className="border-t border-hairline pt-5">
-                      <p className="mb-3 text-[13px] font-semibold text-ink-900">
+                    <div>
+                      <p className="mb-3 text-[13px] font-bold text-ink-900">
                         Message to the customer
                       </p>
                       <MessagePanel
@@ -130,7 +219,7 @@ export default function ReviewQueue({ refreshToken, onBack }) {
                       />
                     </div>
 
-                    <dl className="grid grid-cols-1 gap-x-6 gap-y-3 border-t border-hairline pt-4 sm:grid-cols-3">
+                    <dl className="grid grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-3">
                       <Field label="Decision ID">
                         <IdChip value={decision.decision_id} truncate={13} />
                       </Field>
@@ -141,6 +230,8 @@ export default function ReviewQueue({ refreshToken, onBack }) {
                         <IdChip value={decision.merchant_id} truncate={13} />
                       </Field>
                     </dl>
+
+                    {parsed.raw ? <RawDisclosure>{parsed.raw}</RawDisclosure> : null}
                   </div>
                 ) : null}
               </li>
