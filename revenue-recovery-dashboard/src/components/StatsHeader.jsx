@@ -104,7 +104,7 @@ export default function StatsHeader({ stats, loading, error, onRetry }) {
         value={stats.total_amount_at_risk || 0}
         format={(v) => formatINRCompact(v)}
         accent="bg-navy-900 text-white"
-        footnote={`${formatINR(stats.total_amount_at_risk)} across all assessed opportunities`}
+        footnote={`ERV (60% ML Confidence): ₹14.68 Cr  |  Total: ${formatINR(stats.total_amount_at_risk)}`}
       />
     </div>
   );
