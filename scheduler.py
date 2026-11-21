@@ -1,32 +1,35 @@
 """
-scheduler.py — long-running process that polls for undecided recovery
-opportunities on a fixed interval and runs them through the recovery agent.
+scheduler.py — the autonomous polling worker.
 
-This is the piece that turns agent_graph.py from "a script you run by hand"
-into something that behaves like a real service: structured logging to a
-file (not print statements), a configurable poll interval, and clean
-shutdown on Ctrl+C or SIGTERM instead of dying mid-batch.
+Two ways to run it, both sharing the same cycle:
 
-Usage:
-    python3 scheduler.py                        # poll every 60s, run forever
-    python3 scheduler.py --interval 30           # poll every 30s
-    python3 scheduler.py --interval 10 --max-cycles 3   # for testing/demo — stop after N cycles
+  1. Integrated (default for the app): main.py's FastAPI lifespan starts
+     worker_loop() as an asyncio background task, so a single command —
+     `uvicorn main:app` — brings up the API, the webhook listener and the
+     retry/polling loop together, and shuts them down together.
+
+  2. Standalone (for demos or a separate process):
+         python3 scheduler.py                          # poll every 60s
+         python3 scheduler.py --interval 30
+         python3 scheduler.py --interval 10 --max-cycles 3
 
 What this deliberately does NOT do (so it doesn't overclaim what it is):
   - No distributed queue (Celery/Redis/RabbitMQ) — SQLite + polling is the
     honest match for this project's scale. A queue is the right upgrade
-    only once there's a real ingestion source producing events faster than
-    a poll loop can keep up with.
-  - No retry backoff — a failed opportunity is logged via
+    only once webhook/event volume outgrows a single worker.
+  - No opportunity-level retry loops — a failed opportunity is logged via
     DataIntegrityError's own decision/audit trail (see agent_graph.py) and
-    is not reprocessed; it's not simply retried until it works.
-  - No multi-process/concurrency — SQLite + a single polling loop is
-    intentionally simple. Don't scale this to multiple workers without
-    first moving off a single-file SQLite database (write contention will
-    become a real bottleneck before scale is a real concern).
+    is not silently retried forever. (Live provider sends DO retry
+    connection-level failures with bounded backoff — see dispatchers.py —
+    but never uncertain deliveries.)
+  - No multi-process concurrency — SQLite allows ONE writer at a time.
+    WAL mode + busy_timeout (see db.py) make reads and single-writer writes
+    coexist smoothly, but they do not make concurrent writes scale; do not
+    run multiple worker processes against one SQLite file.
 """
 
 import argparse
+import asyncio
 import logging
 import signal
 import sys
@@ -54,6 +57,47 @@ _console_handler.setFormatter(_formatter)
 logger.addHandler(_console_handler)
 
 
+def run_worker_cycle(cycle: int) -> None:
+    """One poll + batch. Isolated so a cycle-level failure (e.g. DB file
+    temporarily locked) is logged and the next cycle still runs."""
+    cycle_start = datetime.now()
+    logger.info(f"--- Cycle {cycle} starting ---")
+    try:
+        summary = run_batch()
+        logger.info(
+            f"Cycle {cycle} complete. dispatched={summary.get('dispatched', 0)} "
+            f"skipped={summary.get('skipped', 0)} "
+            f"pending_review={summary.get('pending_review', 0)} "
+            f"errors={summary.get('errors', 0)} "
+            f"(took {(datetime.now() - cycle_start).total_seconds():.1f}s)"
+        )
+    except Exception as e:
+        logger.error(f"Cycle {cycle} failed unexpectedly: {type(e).__name__}: {e}", exc_info=True)
+
+
+async def worker_loop(stop_event: asyncio.Event, interval_seconds: int) -> None:
+    """The always-on loop main.py hosts inside uvicorn.
+
+    run_batch is synchronous (sqlite3 + LangGraph), so each cycle runs in a
+    thread via asyncio.to_thread and the event loop stays free to serve
+    API requests while a batch is in flight. Shutdown is graceful: the
+    current cycle finishes, then the loop exits.
+    """
+    logger.info(f"Background worker started. Poll interval: {interval_seconds}s.")
+    cycle = 0
+    try:
+        while not stop_event.is_set():
+            cycle += 1
+            await asyncio.to_thread(run_worker_cycle, cycle)
+            try:
+                # Wait for the next cycle, but wake immediately on shutdown.
+                await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+            except asyncio.TimeoutError:
+                pass  # normal: interval elapsed, run the next cycle
+    finally:
+        logger.info("Background worker stopped.")
+
+
 class GracefulShutdown:
     """Catches SIGINT/SIGTERM and lets the current cycle finish instead of
     killing the process mid-batch, which could leave a partially-processed
@@ -71,6 +115,9 @@ class GracefulShutdown:
 
 
 def run_scheduler(interval_seconds: int, max_cycles: int = None) -> None:
+    """Standalone mode: same cycles as worker_loop, in a plain sync loop."""
+    from db import init_db
+    init_db()
     shutdown = GracefulShutdown()
     logger.info(f"Recovery agent scheduler starting. Poll interval: {interval_seconds}s. "
                 f"Log file: {LOG_FILE}")
@@ -78,20 +125,7 @@ def run_scheduler(interval_seconds: int, max_cycles: int = None) -> None:
     cycle = 0
     while not shutdown.shutdown_requested:
         cycle += 1
-        cycle_start = datetime.now()
-        logger.info(f"--- Cycle {cycle} starting ---")
-
-        try:
-            summary = run_batch()
-            logger.info(
-                f"Cycle {cycle} complete. dispatched={summary.get('dispatched', 0)} "
-                f"skipped={summary.get('skipped', 0)} errors={summary.get('errors', 0)} "
-                f"(took {(datetime.now() - cycle_start).total_seconds():.1f}s)"
-            )
-        except Exception as e:
-            # A cycle-level failure (e.g. DB file locked/missing) should not
-            # kill the scheduler itself — log it and try again next cycle.
-            logger.error(f"Cycle {cycle} failed unexpectedly: {type(e).__name__}: {e}", exc_info=True)
+        run_worker_cycle(cycle)
 
         if max_cycles is not None and cycle >= max_cycles:
             logger.info(f"Reached --max-cycles={max_cycles}. Stopping.")

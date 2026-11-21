@@ -26,7 +26,6 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 
-DB_PATH = "AI Revenue Recovery Platform (SQLite).db"
 
 # Root causes actually present in revenue_risk_events.root_cause for
 # order-based (non-subscription) events.
@@ -50,10 +49,13 @@ MANDATE_ROOT_CAUSES = [
 ]
 
 
+from db import get_conn as _shared_get_conn
+
+
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    # Shared connection factory (db.py): same DB_PATH config and the same
+    # WAL / busy_timeout / foreign_keys pragmas as the API and the agent.
+    return _shared_get_conn()
 
 
 def _insert_risk_event_and_opportunity(

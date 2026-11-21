@@ -89,6 +89,15 @@ export const OUTCOME = {
     tone: "neutral",
     description: "The agent hasn't reached this opportunity yet.",
   },
+  delivery_unknown: {
+    key: "delivery_unknown",
+    label: "Delivery unknown",
+    short: "Unknown",
+    tone: "review",
+    description:
+      "The send was interrupted and the provider may still have delivered it. " +
+      "Reconcile against the provider dashboard before any retry — the agent will not resend this on its own.",
+  },
 };
 
 export const outcomeFor = (status) => OUTCOME[status] ?? OUTCOME.undecided;

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ChevronDown, ShieldCheck } from "lucide-react";
+import { Check, ChevronDown, ShieldCheck, X } from "lucide-react";
 import {
   Card,
   CardHeader,
@@ -72,13 +72,49 @@ function ConfidenceMeter({ score }) {
 
 export default function ReviewQueue({ refreshToken, onBack }) {
   const [openId, setOpenId] = useState(null);
+  // decision_id -> "approved" | "dismissed": resolved rows drop out of the
+  // queue immediately (optimistic), and come back with an error if the
+  // backend rejects the call.
+  const [resolved, setResolved] = useState({});
+  const [pendingId, setPendingId] = useState(null);
+  const [actionErrors, setActionErrors] = useState({});
 
   const { data, loading, error, reload } = useApi(
     (opts) => api.decisions({ requiresHumanReview: true, limit: 50, offset: 0 }, opts),
     [refreshToken]
   );
 
-  const rows = data ?? [];
+  const rows = (data ?? []).filter((d) => !resolved[d.decision_id]);
+
+  async function resolveDecision(decision, action) {
+    const id = decision.decision_id;
+    const outcome = action === "approve" ? "approved" : "dismissed";
+    setPendingId(id);
+    setResolved((cur) => ({ ...cur, [id]: outcome })); // optimistic
+    setOpenId((cur) => (cur === id ? null : cur));
+    try {
+      if (action === "approve") {
+        await api.approveDecision(id);
+      } else {
+        await api.rejectDecision(id, null);
+      }
+    } catch (err) {
+      // Roll the row back in and say why (e.g. 401 without an admin key,
+      // 409 because someone else already resolved it).
+      setResolved((cur) => {
+        const next = { ...cur };
+        delete next[id];
+        return next;
+      });
+      setActionErrors((cur) => ({
+        ...cur,
+        [id]: err?.detail || err?.message || "The action failed.",
+      }));
+      setOpenId(id);
+    } finally {
+      setPendingId(null);
+    }
+  }
 
   return (
     <Card className="overflow-hidden">
@@ -174,6 +210,40 @@ export default function ReviewQueue({ refreshToken, onBack }) {
                     className="animate-expandDown space-y-6 px-4 pb-6 pt-2 sm:px-5"
                   >
                     <FlaggedNotice recommendedAction={decision.recommended_action} />
+
+                    {/* Approve & Send / Dismiss — the human decision the
+                        backend is waiting on. Optimistic: the row leaves the
+                        queue instantly and returns with an error on failure. */}
+                    <div className="flex flex-wrap items-center gap-3 rounded-2xl bg-subtle px-4 py-3.5 sm:px-5">
+                      <button
+                        type="button"
+                        disabled={pendingId === decision.decision_id}
+                        onClick={() => resolveDecision(decision, "approve")}
+                        className="inline-flex items-center gap-1.5 rounded-full bg-brand-600 px-4 py-2 text-xs font-bold text-white transition-colors hover:bg-brand-700 disabled:opacity-50"
+                      >
+                        <Check size={14} strokeWidth={3} aria-hidden="true" />
+                        Approve &amp; send
+                      </button>
+                      <button
+                        type="button"
+                        disabled={pendingId === decision.decision_id}
+                        onClick={() => resolveDecision(decision, "dismiss")}
+                        className="inline-flex items-center gap-1.5 rounded-full bg-surface px-4 py-2 text-xs font-bold text-ink-700 shadow-soft transition-colors hover:bg-hairline disabled:opacity-50"
+                      >
+                        <X size={14} strokeWidth={3} aria-hidden="true" />
+                        Dismiss
+                      </button>
+                      <span className="text-xs font-medium text-ink-400">
+                        {pendingId === decision.decision_id
+                          ? "Talking to the backend…"
+                          : "Approving sends the drafted message through the normal dispatch path; dismissing holds all contact."}
+                      </span>
+                      {actionErrors[decision.decision_id] ? (
+                        <span className="w-full text-xs font-bold text-review" role="alert">
+                          Couldn’t resolve this decision: {actionErrors[decision.decision_id]}
+                        </span>
+                      ) : null}
+                    </div>
 
                     <div className="rounded-2xl bg-surface px-5 py-6 shadow-soft sm:px-7">
                       <PipelineStepper stages={buildStages({ decision, opportunity: null })} />

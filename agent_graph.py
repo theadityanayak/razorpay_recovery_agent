@@ -23,18 +23,32 @@ Design decisions worth calling out (vs. the starter stub):
   5. State carries every FK we need to insert child rows correctly
      (recovery_opportunity_id, decision_id) instead of only business fields.
   6. LLM message generation (generate_message_node) only runs on the
-     APPROVED path — a blocked contact never gets a message drafted, since
-     there's no point spending an API call on something that won't be sent.
-  7. Dispatch now closes a real gap: previously a successful dispatch never
-     wrote a new customer_contact_history row, so the compliance guardrail
-     was blind to the very messages this agent sent. It now writes
+     policy-approved path — a blocked contact never gets a message drafted.
+  7. Dispatch closes a real gap: a successful dispatch writes
      recovery_interventions + customer_contact_history +
-     recovery_generated_messages together on every real dispatch, and
-     recovery_attempts.contact_history_id is populated instead of always
-     NULL.
+     recovery_generated_messages together, and
+     recovery_attempts.contact_history_id is populated instead of always NULL.
+
+Closed-loop upgrade (v2):
+  8. Pluggable dispatch (dispatchers.py): strategies that need a one-click
+     retry create a Razorpay Payment Link, which is injected into the Gemini
+     draft; the message goes out via Twilio (WhatsApp/SMS) or Resend (email).
+     DRY_RUN=true (the default) runs the identical code path, logs the exact
+     payloads, and writes the same audit rows with dry_run=1 — nothing is
+     charged and nothing is sent.
+  9. Human-in-the-loop: a policy-approved decision whose confidence is below
+     settings.human_review_confidence_threshold is flagged
+     requires_human_review=1 and its action is parked as 'pending_review'
+     instead of dispatching. The dashboard's review queue resolves it through
+     POST /decisions/{id}/approve (which dispatches via
+     execute_human_approved_dispatch) or /reject (human_reject_decision).
+ 10. If GOOGLE_API_KEY is missing or the Gemini call fails, message drafting
+     falls back to a deterministic template marked '[template]' so the
+     pipeline still completes end-to-end and the audit trail says why.
 """
 
-import os
+import json
+import logging
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -42,14 +56,16 @@ from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any
 
 from pydantic import BaseModel, Field
-from langchain_google_genai import ChatGoogleGenerativeAI
-
-IST = ZoneInfo("Asia/Kolkata")
-
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, END
 
-DB_PATH = "AI Revenue Recovery Platform (SQLite).db"
+from config import settings
+from db import get_conn
+from dispatchers import create_payment_link, send_message
+
+logger = logging.getLogger("recovery_agent")
+
+IST = ZoneInfo("Asia/Kolkata")
 
 
 class DataIntegrityError(Exception):
@@ -74,44 +90,12 @@ def _new_id() -> str:
     return str(uuid.uuid4())
 
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-
-def _ensure_schema(conn: sqlite3.Connection) -> None:
-    """recovery_generated_messages doesn't exist in the original Tonic
-    Fabricate schema — there's no column anywhere in the 25 original tables
-    for actual message body text (recovery_interventions.message_template
-    is a template NAME, not content). Creates it if missing so this module
-    can be imported into a fresh copy of the DB without a separate manual
-    migration step."""
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS recovery_generated_messages (
-            message_id TEXT PRIMARY KEY,
-            decision_id TEXT NOT NULL,
-            recovery_opportunity_id TEXT NOT NULL,
-            channel TEXT,
-            message_body TEXT,
-            tone_used TEXT,
-            personalization_reasoning TEXT,
-            model_used TEXT,
-            generated_at TEXT
-        )
-        """
-    )
-    conn.commit()
-
-
 # --- MERCHANT TONE HEURISTIC ---
 # NOTE: merchants has no real tone/brand-voice column — Tonic Fabricate
-# never generated one. This is Claude's inference from business_type +
-# industry, not real merchant data. Every tone string returned here is
-# prefixed "[heuristic]" wherever it's persisted, so nobody downstream
-# (including a demo audience) mistakes it for actual merchant input.
+# never generated one. This is an inference from business_type + industry,
+# not real merchant data. Every tone string returned here is prefixed
+# "[heuristic]" wherever it's persisted, so nobody downstream (including a
+# demo audience) mistakes it for actual merchant input.
 _INDUSTRY_TONE = {
     "healthcare": "careful, reassuring, no urgency pressure — trust matters more than conversion",
     "SaaS": "professional, concise, solution-focused",
@@ -143,6 +127,32 @@ def derive_merchant_tone(business_type: Optional[str], industry: Optional[str]) 
     return f"[heuristic] {tone}"
 
 
+# Strategies whose customer message should carry a one-click Razorpay
+# Payment Link for instant retry.
+LINK_STRATEGIES = {
+    "send_one_click_retry_link",
+    "delayed_smart_retry",
+    "offer_bnpl_or_split_pay",
+    "request_mandate_reauth",
+}
+
+# Friendly phrasing for the template fallback — the customer should never
+# see a raw gateway error code.
+_FRIENDLY_FAILURE = {
+    "insufficient_funds": "the payment didn't go through due to insufficient funds",
+    "expired_card": "the card on file has expired",
+    "card_declined": "the card was declined by the bank",
+    "incorrect_pin": "the card verification didn't succeed",
+    "bank_outage": "your bank's systems were temporarily unreachable",
+    "bank_server_error": "your bank's systems were temporarily unreachable",
+    "gateway_timeout": "the payment timed out at the gateway",
+    "network_timeout": "the payment timed out before it could complete",
+    "npci_outage": "the UPI network was temporarily unavailable",
+    "customer_cancelled": "the payment was cancelled before completing",
+    "mandate_reauth_required": "your auto-pay mandate needs to be re-authorised",
+}
+
+
 # --- 1. STATE DEFINITION ---
 class RecoveryState(TypedDict, total=False):
     # Input
@@ -156,6 +166,7 @@ class RecoveryState(TypedDict, total=False):
     customer_id: str
     merchant_id: str
     amount: float
+    currency: str
     event_type: str
     risk_root_cause: str                    # revenue_risk_events.root_cause
     payment_failure_code: Optional[str]      # payment_attempts.failure_code (latest attempt)
@@ -171,17 +182,24 @@ class RecoveryState(TypedDict, total=False):
     selected_strategy: Optional[str]
     chosen_channel: Optional[str]
     confidence_score: Optional[float]
+    requires_human_review: bool
+
+    # Payment link (created before drafting so the message can carry it)
+    payment_link_url: Optional[str]
+    payment_link_id: Optional[str]
 
     # LLM-generated message (only populated on the approved path)
     generated_message_body: Optional[str]
     generated_message_reasoning: Optional[str]
     tone_used: Optional[str]
+    message_model_used: Optional[str]
 
     # Persistence FKs produced along the way
     decision_id: Optional[str]
     action_id: Optional[str]
+    message_id: Optional[str]
 
-    execution_status: Optional[str]          # 'dispatched' | 'skipped' | 'failed'
+    execution_status: Optional[str]          # 'dispatched' | 'skipped' | 'pending_review' | 'failed'
 
 
 # --- 2. AGENT NODES ---
@@ -234,6 +252,19 @@ def _log_data_integrity_failure(conn: sqlite3.Connection, opportunity_id: str, r
     conn.commit()
 
 
+def _audit(conn: sqlite3.Connection, *, decision_id: Optional[str], action_id: Optional[str],
+           event_type: str, before_state: Optional[str], after_state: Optional[str]) -> None:
+    conn.execute(
+        """
+        INSERT INTO recovery_audit_logs (
+            audit_log_id, decision_id, action_id, event_type,
+            before_state, after_state, logged_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (_new_id(), decision_id, action_id, event_type, before_state, after_state, _now_iso()),
+    )
+
+
 def risk_event_ingestion_node(state: RecoveryState) -> Dict[str, Any]:
     """Loads the risk event + opportunity + latest payment attempt + mandate status.
 
@@ -248,7 +279,7 @@ def risk_event_ingestion_node(state: RecoveryState) -> Dict[str, Any]:
             SELECT ro.opportunity_id, ro.revenue_risk_event_id, ro.customer_id,
                    ro.merchant_id, ro.recommended_intervention,
                    ro.estimated_recovery_probability, ro.eligible_for_contact,
-                   ro.ineligible_reason
+                   ro.ineligible_reason, ro.status
             FROM recovery_opportunities ro
             WHERE ro.opportunity_id = ?
             """,
@@ -288,10 +319,16 @@ def risk_event_ingestion_node(state: RecoveryState) -> Dict[str, Any]:
             (opp["revenue_risk_event_id"],),
         ).fetchone()
 
-        # Latest payment attempt for the order, if this event has one.
+        currency = "INR"
         payment_failure_code = None
         payment_method = None
         if risk_event["order_id"]:
+            order = conn.execute(
+                "SELECT currency FROM orders WHERE order_id = ?",
+                (risk_event["order_id"],),
+            ).fetchone()
+            if order is not None and order["currency"]:
+                currency = order["currency"]
             pa = conn.execute(
                 """
                 SELECT failure_code, payment_method
@@ -318,7 +355,7 @@ def risk_event_ingestion_node(state: RecoveryState) -> Dict[str, Any]:
                 (risk_event["subscription_id"],),
             ).fetchone()
             if mandate is not None:
-                mandate_requires_reauth = bool(mandate["requires_reauth"])
+                mandate_requires_reauth = str(mandate["requires_reauth"]) in ("1", "true", "True")
 
         return {
             "risk_event_id": risk_event["risk_event_id"],
@@ -328,6 +365,7 @@ def risk_event_ingestion_node(state: RecoveryState) -> Dict[str, Any]:
             "customer_id": opp["customer_id"],
             "merchant_id": opp["merchant_id"],
             "amount": risk_event["amount_at_risk"],
+            "currency": currency,
             "event_type": risk_event["event_type"],
             "risk_root_cause": risk_event["root_cause"],
             "payment_failure_code": payment_failure_code,
@@ -340,7 +378,12 @@ def risk_event_ingestion_node(state: RecoveryState) -> Dict[str, Any]:
             # runs, but this makes the reason traceable to its true source.
             "policy_rejection_reason": (
                 f"pre-ineligible: {opp['ineligible_reason']}"
-                if not opp["eligible_for_contact"] else None
+                if str(opp["eligible_for_contact"]) in ("0", "false", "False")
+                # A recovery webhook (payment.captured / payment_link.paid /
+                # subscription.charged) may close the loop while this run was
+                # still queued — never message a customer who already paid.
+                else "opportunity already recovered"
+                if opp["status"] == "recovered" else None
             ),
         }
     finally:
@@ -414,16 +457,23 @@ def compliance_guardrail_node(state: RecoveryState) -> Dict[str, Any]:
                 "execution_status": "skipped",
             }
 
-        # Opt-out check
-        if policy["stop_after_opt_out"]:
-            opted_out = conn.execute(
+        # Opt-out check: the customer's CURRENT opt state is the latest
+        # opt_out/opt_in contact-history row (or any legacy row with the
+        # flag set), newest first — so a STOP blocks every future contact
+        # and a later START re-enables it. CSV exports may store the flag
+        # as TEXT, so compare normalized.
+        if str(policy["stop_after_opt_out"]) in ("1", "true", "True"):
+            opt_rows = conn.execute(
                 """
-                SELECT 1 FROM customer_contact_history
-                WHERE customer_id = ? AND opt_out_flag = 1
-                LIMIT 1
+                SELECT opt_out_flag FROM customer_contact_history
+                WHERE customer_id = ?
+                  AND (message_status IN ('opt_out', 'opt_in')
+                       OR opt_out_flag IN ('1', 'true', 'True', 1))
+                ORDER BY contacted_at DESC
                 """,
                 (state["customer_id"],),
-            ).fetchone()
+            ).fetchall()
+            opted_out = bool(opt_rows) and str(opt_rows[0]["opt_out_flag"]).strip().lower() in ("1", "true")
             if opted_out:
                 return {
                     "policy_approved": False,
@@ -455,14 +505,17 @@ def compliance_guardrail_node(state: RecoveryState) -> Dict[str, Any]:
 
         # Frequency caps. Cast defensively — some CSV-originated SQLite
         # exports store numeric columns as TEXT rather than INTEGER/REAL.
-        max_24h = int(policy["max_contacts_per_24h"])
-        max_7d = int(policy["max_contacts_per_7d"])
+        # Inbound rows (a customer's reply, STOP or START) are not merchant
+        # contacts and never consume the contact budget.
+        max_24h = int(float(policy["max_contacts_per_24h"]))
+        max_7d = int(float(policy["max_contacts_per_7d"]))
         min_interval_hours = float(policy["minimum_contact_interval_hours"])
 
         count_24h = conn.execute(
             """
             SELECT COUNT(*) AS c FROM customer_contact_history
             WHERE customer_id = ? AND contacted_at >= datetime('now', '-1 day')
+              AND (message_status IS NULL OR message_status NOT IN ('replied', 'opt_out', 'opt_in'))
             """,
             (state["customer_id"],),
         ).fetchone()["c"]
@@ -477,6 +530,7 @@ def compliance_guardrail_node(state: RecoveryState) -> Dict[str, Any]:
             """
             SELECT COUNT(*) AS c FROM customer_contact_history
             WHERE customer_id = ? AND contacted_at >= datetime('now', '-7 days')
+              AND (message_status IS NULL OR message_status NOT IN ('replied', 'opt_out', 'opt_in'))
             """,
             (state["customer_id"],),
         ).fetchone()["c"]
@@ -487,18 +541,26 @@ def compliance_guardrail_node(state: RecoveryState) -> Dict[str, Any]:
                 "execution_status": "skipped",
             }
 
-        # Minimum interval since last contact
+        # Minimum interval since last contact (same inbound exclusion)
         last_contact = conn.execute(
             """
             SELECT contacted_at FROM customer_contact_history
             WHERE customer_id = ?
+              AND (message_status IS NULL OR message_status NOT IN ('replied', 'opt_out', 'opt_in'))
             ORDER BY contacted_at DESC LIMIT 1
             """,
             (state["customer_id"],),
         ).fetchone()
         if last_contact is not None:
-            last_dt = datetime.fromisoformat(last_contact["contacted_at"].replace("Z", "+00:00"))
-            hours_since = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
+            try:
+                last_dt = datetime.fromisoformat(
+                    str(last_contact["contacted_at"]).replace("Z", "+00:00").replace(" ", "T")
+                )
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+                hours_since = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
+            except ValueError:
+                hours_since = float("inf")  # unparseable timestamp: don't block on it
             if hours_since < min_interval_hours:
                 return {
                     "policy_approved": False,
@@ -532,14 +594,25 @@ def strategy_selector_node(state: RecoveryState) -> Dict[str, Any]:
     else:
         strategy, channel, confidence = "standard_dunning_reminder", "email", 0.3
 
+    # Human-in-the-loop: a policy-approved but low-confidence decision is
+    # parked for a person instead of auto-dispatching. Policy-blocked
+    # decisions never need review — the guardrail already said no.
+    requires_review = bool(
+        state.get("policy_approved")
+        and confidence is not None
+        and confidence < settings.human_review_confidence_threshold
+        and strategy != "no_action"
+    )
+
     return {
         "selected_strategy": strategy,
         "chosen_channel": channel,
         "confidence_score": confidence,
+        "requires_human_review": requires_review,
     }
 
 
-# --- LLM MESSAGE GENERATION ---
+# --- MESSAGE GENERATION ---
 
 class GeneratedMessage(BaseModel):
     """Structured output schema — forces the model to return exactly this
@@ -556,21 +629,83 @@ class GeneratedMessage(BaseModel):
     )
 
 
-# Model held at module level (not re-constructed per call) so it can be
-# monkeypatched in tests without hitting the real API, and so repeated
-# invocations in a batch don't pay object-construction overhead each time.
-# Haiku is the right cost/latency tier for a short, structured SMS/WhatsApp
-# draft — this isn't a task that needs a larger model's reasoning depth.
-_message_llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.2)
-_message_chain = _message_llm.with_structured_output(GeneratedMessage)
+# The LLM chain is built lazily on first use: constructing it at import time
+# would crash any environment that doesn't have the langchain-google-genai
+# dependency or GOOGLE_API_KEY installed yet, including plain DRY_RUN demos.
+_message_chain = None
+
+
+def _get_message_chain():
+    global _message_chain
+    if _message_chain is None:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+
+        llm = ChatGoogleGenerativeAI(model=settings.gemini_model, temperature=0.2)
+        _message_chain = llm.with_structured_output(GeneratedMessage)
+    return _message_chain
+
+
+def _template_message(
+    *,
+    merchant_name: str,
+    amount: Optional[float],
+    failure_reason: str,
+    payment_link_url: Optional[str],
+    channel: Optional[str],
+) -> str:
+    """Deterministic fallback copy used when Gemini isn't configured or the
+    call fails. Marked '[template]' everywhere it's persisted so nobody
+    mistakes it for model output."""
+    friendly = _FRIENDLY_FAILURE.get(failure_reason, "the payment didn't complete")
+    amount_txt = f" of ₹{float(amount):,.2f}" if amount is not None else ""
+    link_txt = f" You can complete it securely here: {payment_link_url}" if payment_link_url else ""
+    return (
+        f"Hi, your payment{amount_txt} to {merchant_name} didn't go through — "
+        f"{friendly}.{link_txt} Reply STOP to opt out."
+    )
+
+
+def _load_customer(conn: sqlite3.Connection, customer_id: str):
+    return conn.execute(
+        "SELECT customer_id, first_name, last_name, email, phone FROM customers WHERE customer_id = ?",
+        (customer_id,),
+    ).fetchone()
+
+
+def _ensure_payment_link(state: RecoveryState, merchant_name: str, customer) -> Dict[str, Any]:
+    """Creates (once) the Razorpay Payment Link for strategies whose message
+    carries a one-click retry. In DRY_RUN this returns a clearly-marked
+    placeholder URL and logs the exact payload that would be created."""
+    if state.get("payment_link_url"):
+        return {}
+    if state.get("selected_strategy") not in LINK_STRATEGIES:
+        return {}
+
+    result = create_payment_link(
+        amount_inr=float(state.get("amount") or 0),
+        currency=state.get("currency") or "INR",
+        reference_id=state["recovery_opportunity_id"],
+        description=f"Payment retry for {merchant_name}",
+        customer_name=(
+            f"{customer['first_name']} {customer['last_name']}".strip() if customer else None
+        ),
+        customer_email=customer["email"] if customer else None,
+        customer_contact=customer["phone"] if customer else None,
+    )
+    if result.status == "failed":
+        # A missing link must not kill the pipeline — the message goes out
+        # without it and the failure is recorded on the dispatch audit row.
+        logger.warning("Payment link creation failed for %s: %s",
+                       state["recovery_opportunity_id"], result.error)
+        return {}
+    return {"payment_link_url": result.payment_link_url, "payment_link_id": result.payment_link_id}
 
 
 def generate_message_node(state: RecoveryState) -> Dict[str, Any]:
-    """Drafts hyper-personalized recovery copy via Claude, using real
-    customer payment history + a merchant tone heuristic + the exact
-    failure reason + the strategy already selected. Only runs on the
-    approved path (see guardrail_router / graph wiring below) — a blocked
-    contact never gets a message drafted."""
+    """Drafts the recovery message, with the payment link created FIRST so
+    the copy can carry it. Gemini when configured; deterministic template
+    otherwise. Only runs on the policy-approved path (see message_gen_router).
+    """
     conn = get_conn()
     try:
         history = conn.execute(
@@ -587,47 +722,90 @@ def generate_message_node(state: RecoveryState) -> Dict[str, Any]:
             "SELECT merchant_name, business_type, industry FROM merchants WHERE merchant_id = ?",
             (state["merchant_id"],),
         ).fetchone()
+
+        customer = _load_customer(conn, state["customer_id"])
     finally:
         conn.close()
+
+    merchant_name = merchant["merchant_name"] if merchant else "Unknown merchant"
+    updates: Dict[str, Any] = _ensure_payment_link(state, merchant_name, customer)
+    payment_link_url = updates.get("payment_link_url") or state.get("payment_link_url")
 
     tone = derive_merchant_tone(
         merchant["business_type"] if merchant else None,
         merchant["industry"] if merchant else None,
     )
-
-    history_summary = (
-        "no prior order history on file" if history is None else
-        f"{history['total_orders']} total orders, {history['successful_orders']} successful, "
-        f"{history['failed_orders']} failed, historical success rate "
-        f"{float(history['historical_payment_success_rate']):.0%}, "
-        f"typically pays via {history['typical_payment_method']} around "
-        f"{history['typical_payment_hour_ist']}:00 IST, average order value "
-        f"₹{float(history['average_order_value']):.2f}"
-    )
-
     failure_reason = state.get("payment_failure_code") or state.get("risk_root_cause") or "unknown"
 
-    prompt = f"""Draft a {state['chosen_channel']} recovery message for a customer whose
+    body: str
+    reasoning: str
+    model_used: str
+
+    if not settings.google_api_key:
+        body = _template_message(
+            merchant_name=merchant_name,
+            amount=state.get("amount"),
+            failure_reason=failure_reason,
+            payment_link_url=payment_link_url,
+            channel=state.get("chosen_channel"),
+        )
+        reasoning = "[template] GOOGLE_API_KEY not configured; deterministic fallback copy used."
+        model_used = "template-fallback"
+    else:
+        history_summary = (
+            "no prior order history on file" if history is None else
+            f"{history['total_orders']} total orders, {history['successful_orders']} successful, "
+            f"{history['failed_orders']} failed, historical success rate "
+            f"{float(history['historical_payment_success_rate']):.0%}, "
+            f"typically pays via {history['typical_payment_method']} around "
+            f"{history['typical_payment_hour_ist']}:00 IST, average order value "
+            f"₹{float(history['average_order_value']):.2f}"
+        )
+        link_instruction = (
+            f"Include this exact one-click payment link verbatim in the message: {payment_link_url}"
+            if payment_link_url
+            else "No payment link is available; ask the customer to retry from the app or website."
+        )
+        prompt = f"""Draft a {state['chosen_channel']} recovery message for a customer whose
 payment just failed.
 
-Merchant: {merchant['merchant_name'] if merchant else 'Unknown merchant'}
+Merchant: {merchant_name}
 Merchant tone to write in: {tone}
 Customer payment history: {history_summary}
 Payment failure reason: {failure_reason}
 Chosen recovery strategy: {state.get('selected_strategy')}
 Amount at risk: ₹{state.get('amount')}
+{link_instruction}
 
 Write ONE message in the merchant's tone that fits the chosen strategy and
 acknowledges the specific failure reason without sounding robotic or
 repeating the raw error code to the customer."""
+        try:
+            result: GeneratedMessage = _get_message_chain().invoke(prompt)
+            body = result.message_body
+            reasoning = result.personalization_reasoning
+            model_used = settings.gemini_model
+        except Exception as e:
+            logger.error("Gemini drafting failed (%s); using template fallback.", e)
+            body = _template_message(
+                merchant_name=merchant_name,
+                amount=state.get("amount"),
+                failure_reason=failure_reason,
+                payment_link_url=payment_link_url,
+                channel=state.get("chosen_channel"),
+            )
+            reasoning = f"[template] Gemini call failed ({type(e).__name__}: {e}); fallback copy used."
+            model_used = "template-fallback"
 
-    result: GeneratedMessage = _message_chain.invoke(prompt)
-
-    return {
-        "generated_message_body": result.message_body,
-        "generated_message_reasoning": result.personalization_reasoning,
-        "tone_used": tone,
-    }
+    updates.update(
+        {
+            "generated_message_body": body,
+            "generated_message_reasoning": reasoning,
+            "tone_used": tone,
+            "message_model_used": model_used,
+        }
+    )
+    return updates
 
 
 def persist_decision_node(state: RecoveryState) -> Dict[str, Any]:
@@ -636,12 +814,12 @@ def persist_decision_node(state: RecoveryState) -> Dict[str, Any]:
     lost from the audit trail — only recovery_agent_actions differs
     downstream based on whether we actually dispatch.
 
-    Idempotent: recovery_agent_decisions.recovery_opportunity_id is UNIQUE
-    in the real schema (one decision per opportunity, ever). If a decision
-    already exists for this opportunity — e.g. the graph is re-run on the
-    same opportunity during dev/testing, or retried after a crash — reuse
-    it instead of trying to insert a duplicate and crashing with
-    sqlite3.IntegrityError.
+    Idempotent: if a decision already exists for this opportunity — e.g.
+    the graph is re-run on the same opportunity, a webhook is delivered
+    twice, or a crash forced a retry — reuse it instead of inserting a
+    duplicate. A UNIQUE index on recovery_opportunity_id (created by
+    db.ensure_schema when the data allows) makes the database itself the
+    final backstop against the check-then-insert race.
     """
     conn = get_conn()
     try:
@@ -655,60 +833,141 @@ def persist_decision_node(state: RecoveryState) -> Dict[str, Any]:
         decision_id = _new_id()
         approved = state.get("policy_approved", False)
         reason = state.get("policy_rejection_reason")
+        requires_review = 1 if state.get("requires_human_review") else 0
 
         reasoning = (
             f"root_cause={state.get('root_cause_category')}; "
             f"strategy={state.get('selected_strategy')}; "
             f"policy_check={'passed' if approved else 'blocked: ' + str(reason)}"
         )
+        if approved and requires_review:
+            reasoning += (
+                f"; held for human review (confidence "
+                f"{state.get('confidence_score')} < "
+                f"{settings.human_review_confidence_threshold})"
+            )
 
-        conn.execute(
-            """
-            INSERT INTO recovery_agent_decisions (
-                decision_id, recovery_opportunity_id, risk_assessment,
-                estimated_recovery_probability, recommended_action,
-                confidence_score, reasoning_summary, policy_check_result,
-                requires_human_review, decided_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                decision_id,
-                state["recovery_opportunity_id"],
-                state.get("root_cause_category"),
-                state.get("estimated_recovery_probability"),
-                state.get("selected_strategy") or "no_action",
-                state.get("confidence_score"),
-                reasoning,
-                "passed" if approved else "blocked",
-                0,
-                _now_iso(),
-            ),
-        )
-        conn.commit()
+        try:
+            conn.execute(
+                """
+                INSERT INTO recovery_agent_decisions (
+                    decision_id, recovery_opportunity_id, risk_assessment,
+                    estimated_recovery_probability, recommended_action,
+                    confidence_score, reasoning_summary, policy_check_result,
+                    requires_human_review, decided_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision_id,
+                    state["recovery_opportunity_id"],
+                    state.get("root_cause_category"),
+                    state.get("estimated_recovery_probability"),
+                    state.get("selected_strategy") or "no_action",
+                    state.get("confidence_score"),
+                    reasoning,
+                    "passed" if approved else "blocked",
+                    requires_review,
+                    _now_iso(),
+                ),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            # Lost the race against a concurrent run of the same opportunity
+            # (e.g. webhook + worker): reuse the winner's decision.
+            conn.rollback()
+            winner = conn.execute(
+                "SELECT decision_id FROM recovery_agent_decisions WHERE recovery_opportunity_id = ?",
+                (state["recovery_opportunity_id"],),
+            ).fetchone()
+            return {"decision_id": winner["decision_id"] if winner else None}
+
         return {"decision_id": decision_id}
     finally:
         conn.close()
 
 
+def persist_message(state: RecoveryState, conn: sqlite3.Connection) -> Optional[str]:
+    """Writes the drafted message (with its payment link) once per decision.
+    Runs for auto-dispatch AND for pending_review drafts so the reviewer can
+    see exactly what would go out."""
+    if not state.get("generated_message_body") or not state.get("decision_id"):
+        return None
+    existing = conn.execute(
+        "SELECT message_id FROM recovery_generated_messages WHERE decision_id = ?",
+        (state["decision_id"],),
+    ).fetchone()
+    if existing is not None:
+        return existing["message_id"]
+    message_id = _new_id()
+    conn.execute(
+        """
+        INSERT INTO recovery_generated_messages (
+            message_id, decision_id, recovery_opportunity_id, channel,
+            message_body, tone_used, personalization_reasoning,
+            model_used, payment_link_url, generated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            message_id,
+            state["decision_id"],
+            state["recovery_opportunity_id"],
+            state.get("chosen_channel"),
+            state.get("generated_message_body"),
+            state.get("tone_used"),
+            state.get("generated_message_reasoning"),
+            state.get("message_model_used"),
+            state.get("payment_link_url"),
+            _now_iso(),
+        ),
+    )
+    return message_id
+
+
+def _record_dispatch(conn: sqlite3.Connection, *, state: RecoveryState, result) -> str:
+    dispatch_id = _new_id()
+    conn.execute(
+        """
+        INSERT INTO outbound_dispatches (
+            dispatch_id, action_id, decision_id, recovery_opportunity_id,
+            channel, provider, provider_message_id, payment_link_url,
+            payment_link_id, dry_run, status, payload_summary, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            dispatch_id,
+            state.get("action_id"),
+            state["decision_id"],
+            state["recovery_opportunity_id"],
+            result.channel,
+            result.provider,
+            result.provider_message_id,
+            result.payment_link_url or state.get("payment_link_url"),
+            result.payment_link_id or state.get("payment_link_id"),
+            1 if result.dry_run else 0,
+            result.status,
+            result.payload_summary,
+            _now_iso(),
+        ),
+    )
+    return dispatch_id
+
+
 def dispatch_action_node(state: RecoveryState) -> Dict[str, Any]:
-    """Executes (or records as skipped) the chosen action.
+    """Executes, parks for review, or records as skipped the chosen action.
 
-    On an APPROVED dispatch, writes four things together so the FK chain
-    and the compliance guardrail both stay accurate:
-      - recovery_agent_actions   (status='success')
-      - recovery_interventions   (the actual send record: channel, message_template marker)
-      - customer_contact_history (closes the gap where dispatches were
-        previously invisible to the guardrail's frequency/interval checks)
-      - recovery_generated_messages (the LLM's actual drafted copy, for audit)
-      - recovery_attempts.contact_history_id now points at the new contact
-        history row instead of always being NULL.
+    Three paths:
+      - policy blocked  -> action 'skipped' (+ blocked recovery_attempts row)
+      - approved but low confidence -> action 'pending_review', draft message
+        persisted, NO customer contact; a human resolves it from the review
+        queue via execute_human_approved_dispatch / human_reject_decision
+      - approved -> send via dispatchers (Twilio/Resend; DRY_RUN logs the
+        exact payload), then write recovery_agent_actions ('success' or
+        'failed'), recovery_interventions, customer_contact_history (so the
+        guardrail sees its own sends), recovery_attempts and
+        outbound_dispatches together.
 
-    On a BLOCKED dispatch, only recovery_agent_actions + recovery_attempts
-    are written (status='skipped') — no message was generated, no contact
-    happened, so none of the send-side tables get a row.
-
-    Idempotent: if an action already exists for this decision_id, reuse
-    the prior outcome instead of dispatching/logging again.
+    Idempotent: if an action already exists for this decision_id, reuse the
+    prior outcome instead of dispatching/logging again.
     """
     conn = get_conn()
     try:
@@ -721,9 +980,89 @@ def dispatch_action_node(state: RecoveryState) -> Dict[str, Any]:
 
         action_id = _new_id()
         approved = state.get("policy_approved", False)
-        status = "success" if approved else "skipped"
-        executed_at = _now_iso()
+        requires_review = bool(state.get("requires_human_review"))
+        started = datetime.now(timezone.utc)
 
+        if not approved:
+            conn.execute(
+                """
+                INSERT INTO recovery_agent_actions (
+                    action_id, decision_id, action_type, status,
+                    failure_reason, amount_affected, execution_latency_ms, executed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    action_id,
+                    state["decision_id"],
+                    state.get("selected_strategy") or "no_action",
+                    "skipped",
+                    state.get("policy_rejection_reason"),
+                    state.get("amount"),
+                    0,
+                    _now_iso(),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO recovery_attempts (
+                    recovery_attempt_id, recovery_opportunity_id, payment_attempt_id,
+                    contact_history_id, response_id, attempt_type, status,
+                    dispatched_at, delivered_at, delivery_latency_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _new_id(),
+                    state["recovery_opportunity_id"],
+                    None,
+                    None,
+                    None,
+                    state.get("selected_strategy") or "no_action",
+                    "blocked",
+                    _now_iso(),
+                    None,
+                    None,
+                ),
+            )
+            conn.commit()
+            return {"action_id": action_id, "execution_status": "skipped"}
+
+        if requires_review:
+            persist_message(state, conn)
+            conn.execute(
+                """
+                INSERT INTO recovery_agent_actions (
+                    action_id, decision_id, action_type, status,
+                    failure_reason, amount_affected, execution_latency_ms, executed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    action_id,
+                    state["decision_id"],
+                    state.get("selected_strategy") or "no_action",
+                    "pending_review",
+                    None,
+                    state.get("amount"),
+                    0,
+                    _now_iso(),
+                ),
+            )
+            _audit(
+                conn,
+                decision_id=state["decision_id"],
+                action_id=action_id,
+                event_type="held_for_human_review",
+                before_state=None,
+                after_state=f"confidence={state.get('confidence_score')} below "
+                            f"threshold={settings.human_review_confidence_threshold}",
+            )
+            conn.commit()
+            return {"action_id": action_id, "execution_status": "pending_review"}
+
+        # Approved: actually send (or DRY-RUN the send). The action row is
+        # written as 'processing' and committed BEFORE the external call —
+        # a crash mid-dispatch then leaves a durable claim the reconciler
+        # (reconcile.py) can replay, instead of an invisible half-send.
+        persist_message(state, conn)
         conn.execute(
             """
             INSERT INTO recovery_agent_actions (
@@ -735,17 +1074,36 @@ def dispatch_action_node(state: RecoveryState) -> Dict[str, Any]:
                 action_id,
                 state["decision_id"],
                 state.get("selected_strategy") or "no_action",
-                status,
-                None if approved else state.get("policy_rejection_reason"),
+                "processing",
+                None,
                 state.get("amount"),
-                145,    
-                executed_at,
+                0,
+                _now_iso(),
             ),
+        )
+        conn.commit()
+
+        customer = _load_customer(conn, state["customer_id"])
+        result = send_message(
+            channel=state.get("chosen_channel") or "none",
+            body=state.get("generated_message_body") or "",
+            to_phone=customer["phone"] if customer else None,
+            to_email=customer["email"] if customer else None,
+            subject=f"Complete your payment — action needed",
+        )
+        latency_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+        send_ok = result.status in ("sent", "dry_run", "skipped")
+        action_status = "success" if send_ok else "failed"
+
+        conn.execute(
+            "UPDATE recovery_agent_actions SET status = ?, failure_reason = ?, "
+            "execution_latency_ms = ?, executed_at = ? WHERE action_id = ?",
+            (action_status, None if send_ok else result.error, latency_ms, _now_iso(), action_id),
         )
 
         contact_history_id = None
-
-        if approved:
+        if send_ok and result.channel != "none":
+            executed_at = _now_iso()
             intervention_id = _new_id()
             conn.execute(
                 """
@@ -787,27 +1145,323 @@ def dispatch_action_node(state: RecoveryState) -> Dict[str, Any]:
                 ),
             )
 
-            if state.get("generated_message_body"):
-                conn.execute(
-                    """
-                    INSERT INTO recovery_generated_messages (
-                        message_id, decision_id, recovery_opportunity_id, channel,
-                        message_body, tone_used, personalization_reasoning,
-                        model_used, generated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        _new_id(),
-                        state["decision_id"],
-                        state["recovery_opportunity_id"],
-                        state.get("chosen_channel"),
-                        state.get("generated_message_body"),
-                        state.get("tone_used"),
-                        state.get("generated_message_reasoning"),
-                        "claude-haiku-4-5-20251001",
-                        executed_at,
-                    ),
-                )
+            conn.execute(
+                """
+                INSERT INTO recovery_attempts (
+                    recovery_attempt_id, recovery_opportunity_id, payment_attempt_id,
+                    contact_history_id, response_id, attempt_type, status,
+                    dispatched_at, delivered_at, delivery_latency_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _new_id(),
+                    state["recovery_opportunity_id"],
+                    None,
+                    contact_history_id,
+                    None,
+                    state.get("selected_strategy") or "no_action",
+                    "success",
+                    executed_at,
+                    None,
+                    None,
+                ),
+            )
+
+        state_updates = {"action_id": action_id}
+        _record_dispatch(conn, state={**state, "action_id": action_id}, result=result)
+        conn.commit()
+        state_updates["execution_status"] = "dispatched" if send_ok else "failed"
+        return state_updates
+    finally:
+        conn.close()
+
+
+# --- HUMAN-IN-THE-LOOP RESOLUTION (called by main.py's approve/reject) ---
+
+def claim_decision_action(conn, decision) -> str | None:
+    """Atomically claim a decision for dispatch and return the action_id.
+
+    The claim is a committed recovery_agent_actions row in 'processing'
+    state; the UNIQUE index on decision_id plus the guarded UPDATE make it
+    safe against concurrent claimants. Returns None when the decision was
+    already dispatched or is claimed elsewhere."""
+    existing = conn.execute(
+        "SELECT action_id, status FROM recovery_agent_actions WHERE decision_id = ?",
+        (decision["decision_id"],),
+    ).fetchone()
+    if existing is None:
+        action_id = _new_id()
+        try:
+            conn.execute(
+                """
+                INSERT INTO recovery_agent_actions (
+                    action_id, decision_id, action_type, status,
+                    failure_reason, amount_affected, execution_latency_ms, executed_at
+                ) VALUES (?, ?, ?, 'processing', NULL, NULL, 0, ?)
+                """,
+                (action_id, decision["decision_id"],
+                 decision["recommended_action"] or "no_action", _now_iso()),
+            )
+        except sqlite3.IntegrityError:
+            return None  # concurrent claimant won the insert race
+        return action_id
+    if existing["status"] == "success":
+        return None
+    cur = conn.execute(
+        "UPDATE recovery_agent_actions SET status = 'processing', executed_at = ? "
+        "WHERE action_id = ? AND status IN ('pending_review', 'processing', 'failed')",
+        (_now_iso(), existing["action_id"]),
+    )
+    if cur.rowcount == 0:
+        return None
+    return existing["action_id"]
+
+
+def dispatch_claimed_decision(decision_id: str, action_id: str,
+                              audit_action: str = "human_approved_dispatch") -> Dict[str, Any]:
+    """Sends (or dry-run sends) for a decision whose action row the caller
+    already holds a 'processing' claim on. Used by the human-approve flow
+    and by reconcile.reconcile_pending() when it replays a dispatch that was
+    interrupted between claim and final write.
+
+    Reuses the parked draft (including its payment link); drafts one on the
+    spot if the decision predates message persistence."""
+    conn = get_conn()
+    try:
+        decision = conn.execute(
+            "SELECT * FROM recovery_agent_decisions WHERE decision_id = ?", (decision_id,)
+        ).fetchone()
+        if decision is None:
+            raise ValueError(f"No decision found with id {decision_id}")
+
+        opp = conn.execute(
+            """
+            SELECT ro.*, rre.amount_at_risk, rre.order_id, rre.root_cause
+            FROM recovery_opportunities ro
+            JOIN revenue_risk_events rre ON rre.risk_event_id = ro.revenue_risk_event_id
+            WHERE ro.opportunity_id = ?
+            """,
+            (decision["recovery_opportunity_id"],),
+        ).fetchone()
+        if opp is None:
+            raise ValueError("Backing opportunity no longer exists.")
+
+        customer = _load_customer(conn, opp["customer_id"])
+        message = conn.execute(
+            "SELECT * FROM recovery_generated_messages WHERE decision_id = ?", (decision_id,)
+        ).fetchone()
+
+        # Strategy/channel come from stored rows — the graph is not re-run,
+        # so nothing that was already reviewed can change under the sender.
+        strategy = decision["recommended_action"]
+        channel = (message["channel"] if message else None) or "whatsapp"
+
+        payment_link_url = message["payment_link_url"] if message else None
+        payment_link_id = None
+        if strategy in LINK_STRATEGIES and not payment_link_url:
+            merchant = conn.execute(
+                "SELECT merchant_name FROM merchants WHERE merchant_id = ?", (opp["merchant_id"],)
+            ).fetchone()
+            link = create_payment_link(
+                amount_inr=float(opp["amount_at_risk"] or 0),
+                currency="INR",
+                reference_id=opp["opportunity_id"],
+                description=f"Payment retry for {merchant['merchant_name'] if merchant else 'merchant'}",
+                customer_name=(
+                    f"{customer['first_name']} {customer['last_name']}".strip() if customer else None
+                ),
+                customer_email=customer["email"] if customer else None,
+                customer_contact=customer["phone"] if customer else None,
+            )
+            if link.status != "failed":
+                payment_link_url = link.payment_link_url
+                payment_link_id = link.payment_link_id
+
+        body = message["message_body"] if message else None
+        if not body:
+            body = _template_message(
+                merchant_name="the merchant",
+                amount=opp["amount_at_risk"],
+                failure_reason=opp["root_cause"] or "unknown",
+                payment_link_url=payment_link_url,
+                channel=channel,
+            )
+            conn.execute(
+                """
+                INSERT INTO recovery_generated_messages (
+                    message_id, decision_id, recovery_opportunity_id, channel,
+                    message_body, tone_used, personalization_reasoning,
+                    model_used, payment_link_url, generated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _new_id(),
+                    decision_id,
+                    opp["opportunity_id"],
+                    channel,
+                    body,
+                    "[template]",
+                    "[template] drafted at dispatch time; no prior draft existed.",
+                    "template-fallback",
+                    payment_link_url,
+                    _now_iso(),
+                ),
+            )
+        elif payment_link_url and payment_link_url not in body:
+            body = f"{body} {payment_link_url}"
+
+        started = datetime.now(timezone.utc)
+        result = send_message(
+            channel=channel,
+            body=body,
+            to_phone=customer["phone"] if customer else None,
+            to_email=customer["email"] if customer else None,
+            subject="Complete your payment — action needed",
+        )
+        send_ok = result.status in ("sent", "dry_run", "skipped")
+        latency_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+        now = _now_iso()
+
+        conn.execute(
+            "UPDATE recovery_agent_actions SET status = ?, failure_reason = ?, "
+            "amount_affected = ?, execution_latency_ms = ?, executed_at = ? WHERE action_id = ?",
+            ("success" if send_ok else "failed", None if send_ok else result.error,
+             opp["amount_at_risk"], latency_ms, now, action_id),
+        )
+
+        if send_ok and channel != "none":
+            intervention_id = _new_id()
+            conn.execute(
+                """
+                INSERT INTO recovery_interventions (
+                    intervention_id, recovery_opportunity_id, channel,
+                    scheduled_at, executed_at, status, blocked_reason,
+                    message_template, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (intervention_id, opp["opportunity_id"], channel, now, now,
+                 "executed", None, "llm_generated_v1", now),
+            )
+            contact_history_id = _new_id()
+            conn.execute(
+                """
+                INSERT INTO customer_contact_history (
+                    contact_history_id, customer_id, intervention_id,
+                    channel, message_status, opt_out_flag, contacted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (contact_history_id, opp["customer_id"], intervention_id, channel, "sent", 0, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO recovery_attempts (
+                    recovery_attempt_id, recovery_opportunity_id, payment_attempt_id,
+                    contact_history_id, response_id, attempt_type, status,
+                    dispatched_at, delivered_at, delivery_latency_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (_new_id(), opp["opportunity_id"], None, contact_history_id, None,
+                 strategy, "success", now, None, None),
+            )
+
+        _record_dispatch(
+            conn,
+            state={
+                "action_id": action_id,
+                "decision_id": decision_id,
+                "recovery_opportunity_id": opp["opportunity_id"],
+                "payment_link_url": payment_link_url,
+                "payment_link_id": payment_link_id,
+            },
+            result=result,
+        )
+        _audit(
+            conn,
+            decision_id=decision_id,
+            action_id=action_id,
+            event_type=audit_action,
+            before_state="processing",
+            after_state="success" if send_ok else f"failed: {result.error}",
+        )
+        conn.commit()
+        return {
+            "decision_id": decision_id,
+            "status": "dispatched" if send_ok else "failed",
+            "dry_run": result.dry_run,
+            "channel": channel,
+            "provider": result.provider,
+        }
+    finally:
+        conn.close()
+
+
+def execute_human_approved_dispatch(decision_id: str) -> Dict[str, Any]:
+    """Sends the message a human just approved. Claims the decision first;
+    the claim is committed before any external call, so a crash mid-send is
+    replayable by the reconciler instead of invisible.
+
+    Raises ValueError on a decision that can't be dispatched (missing or
+    policy-blocked); returns already_dispatched when another path won."""
+    conn = get_conn()
+    try:
+        decision = conn.execute(
+            "SELECT * FROM recovery_agent_decisions WHERE decision_id = ?", (decision_id,)
+        ).fetchone()
+        if decision is None:
+            raise ValueError(f"No decision found with id {decision_id}")
+        if decision["policy_check_result"] != "passed":
+            raise ValueError("Decision was policy-blocked; there is nothing safe to send.")
+        action_id = claim_decision_action(conn, decision)
+        if action_id is None:
+            return {"decision_id": decision_id, "status": "already_dispatched"}
+        conn.commit()
+    finally:
+        conn.close()
+    return dispatch_claimed_decision(decision_id, action_id)
+
+
+def human_reject_decision(decision_id: str, reason: Optional[str] = None) -> Dict[str, Any]:
+    """Resolves a flagged decision as rejected: no contact ever goes out.
+    Updates the parked action to 'skipped' so the opportunity feed shows the
+    outcome honestly, and writes the human audit trail."""
+    conn = get_conn()
+    try:
+        decision = conn.execute(
+            "SELECT decision_id, recovery_opportunity_id, recommended_action FROM recovery_agent_decisions "
+            "WHERE decision_id = ?",
+            (decision_id,),
+        ).fetchone()
+        if decision is None:
+            raise ValueError(f"No decision found with id {decision_id}")
+
+        rejection = reason or "rejected by human reviewer"
+        now = _now_iso()
+
+        action = conn.execute(
+            "SELECT action_id, status FROM recovery_agent_actions WHERE decision_id = ?",
+            (decision_id,),
+        ).fetchone()
+        if action is None:
+            action_id = _new_id()
+            conn.execute(
+                """
+                INSERT INTO recovery_agent_actions (
+                    action_id, decision_id, action_type, status,
+                    failure_reason, amount_affected, execution_latency_ms, executed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (action_id, decision_id, decision["recommended_action"] or "no_action",
+                 "skipped", rejection, None, 0, now),
+            )
+        else:
+            action_id = action["action_id"]
+            if action["status"] == "success":
+                return {"decision_id": decision_id, "status": "already_dispatched"}
+            conn.execute(
+                "UPDATE recovery_agent_actions SET status = 'skipped', failure_reason = ?, executed_at = ? "
+                "WHERE action_id = ?",
+                (rejection, now, action_id),
+            )
 
         conn.execute(
             """
@@ -817,21 +1471,19 @@ def dispatch_action_node(state: RecoveryState) -> Dict[str, Any]:
                 dispatched_at, delivered_at, delivery_latency_ms
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                _new_id(),
-                state["recovery_opportunity_id"],
-                None,
-                contact_history_id,
-                None,
-                state.get("selected_strategy") or "no_action",
-                status if approved else "blocked",
-                executed_at,
-                None,
-                None,
-            ),
+            (_new_id(), decision["recovery_opportunity_id"], None, None, None,
+             decision["recommended_action"] or "no_action", "rejected", now, None, None),
+        )
+        _audit(
+            conn,
+            decision_id=decision_id,
+            action_id=action_id,
+            event_type="human_rejected",
+            before_state="pending_review",
+            after_state=rejection,
         )
         conn.commit()
-        return {"action_id": action_id, "execution_status": "dispatched" if approved else "skipped"}
+        return {"decision_id": decision_id, "status": "rejected"}
     finally:
         conn.close()
 
@@ -847,7 +1499,7 @@ def message_gen_router(state: RecoveryState) -> str:
 def guardrail_router(state: RecoveryState) -> str:
     """After persisting the decision (which always happens), route to real
     dispatch either way — dispatch_action_node itself decides
-    success vs. skipped so the blocked path still gets logged rows."""
+    success vs. pending_review vs. skipped so every path still gets logged."""
     return "dispatch"
 
 
@@ -882,10 +1534,86 @@ workflow.add_edge("dispatch", END)
 
 recovery_app = workflow.compile()
 
-_conn = get_conn()
-_ensure_schema(_conn)
-_conn.close()
 
+def run_recovery_for_opportunity(recovery_opportunity_id: str,
+                                 trigger_source: str = "worker") -> Dict[str, Any]:
+    """Runs the full graph for one opportunity. This is what the webhook
+    handler and the background worker both call — the agent is triggered
+    the moment a failure event lands, not only on the next poll cycle.
+
+    Every run is traced in the agent_runs table: trigger, start/finish,
+    final execution status, chosen strategy, per-node completion times, and
+    the error text when it raises. The trace row is committed BEFORE the
+    graph starts, so even a hard crash leaves evidence the run began.
+    """
+    import time as _time
+
+    run_id = _new_id()
+    started_at = _now_iso()
+    t0 = _time.monotonic()
+    conn = get_conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO agent_runs (
+                run_id, recovery_opportunity_id, trigger_source,
+                started_at, finished_at, status,
+                selected_strategy, execution_status, error, node_trace_json
+            ) VALUES (?, ?, ?, ?, NULL, 'running', NULL, NULL, NULL, NULL)
+            """,
+            (run_id, recovery_opportunity_id, trigger_source, started_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    node_trace: list = []
+    try:
+        # stream() yields {node_name: state_update} as each node completes,
+        # giving per-node timing; accumulating the updates reproduces
+        # invoke()'s final state.
+        state: Dict[str, Any] = {"recovery_opportunity_id": recovery_opportunity_id}
+        for chunk in recovery_app.stream(state):
+            for node_name, update in chunk.items():
+                node_trace.append({
+                    "node": node_name,
+                    "t_ms": int((_time.monotonic() - t0) * 1000),
+                })
+                if isinstance(update, dict):
+                    state.update(update)
+        result = state
+        status, error = "completed", None
+    except Exception as e:
+        status, error = "error", f"{type(e).__name__}: {e}"[:500]
+        result = None
+        raised = e
+
+    conn = get_conn()
+    try:
+        conn.execute(
+            """
+            UPDATE agent_runs
+            SET finished_at = ?, status = ?, selected_strategy = ?,
+                execution_status = ?, error = ?, node_trace_json = ?
+            WHERE run_id = ?
+            """,
+            (
+                _now_iso(), status,
+                (result or {}).get("selected_strategy"),
+                (result or {}).get("execution_status"),
+                error,
+                json.dumps(node_trace),
+                run_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    if result is None:
+        raise raised  # re-raise the original exception after recording it
+    result["agent_run_id"] = run_id
+    return result
 
 def run_batch(limit: Optional[int] = None) -> Dict[str, int]:
     """Processes every currently-undecided recovery_opportunities row (or up
@@ -896,7 +1624,7 @@ def run_batch(limit: Optional[int] = None) -> Dict[str, int]:
     production — new opportunities arrive continuously, and one bad record
     should never stop the rest of the queue from being processed.
 
-    Returns a summary dict: {"dispatched": n, "skipped": n, "errors": n}.
+    Returns a summary dict: {"dispatched": n, "skipped": n, "errors": n, ...}.
     """
     conn = get_conn()
     query = """
@@ -905,6 +1633,7 @@ def run_batch(limit: Optional[int] = None) -> Dict[str, int]:
         LEFT JOIN recovery_agent_decisions rad
             ON rad.recovery_opportunity_id = ro.opportunity_id
         WHERE rad.decision_id IS NULL
+          AND (ro.status IS NULL OR ro.status != 'recovered')
     """
     if limit is not None:
         query += " LIMIT ?"
@@ -914,7 +1643,7 @@ def run_batch(limit: Optional[int] = None) -> Dict[str, int]:
     conn.close()
 
     opportunity_ids = [r["opportunity_id"] for r in rows]
-    summary = {"dispatched": 0, "skipped": 0, "errors": 0}
+    summary: Dict[str, int] = {"dispatched": 0, "skipped": 0, "pending_review": 0, "errors": 0}
 
     if not opportunity_ids:
         print("No undecided opportunities to process.")
@@ -924,7 +1653,7 @@ def run_batch(limit: Optional[int] = None) -> Dict[str, int]:
 
     for i, opportunity_id in enumerate(opportunity_ids, start=1):
         try:
-            result = recovery_app.invoke({"recovery_opportunity_id": opportunity_id})
+            result = run_recovery_for_opportunity(opportunity_id)
             status = result.get("execution_status", "unknown")
             summary[status] = summary.get(status, 0) + 1
             print(f"[{i}/{len(opportunity_ids)}] {opportunity_id} -> {status} "
@@ -942,7 +1671,8 @@ def run_batch(limit: Optional[int] = None) -> Dict[str, int]:
             print(f"[{i}/{len(opportunity_ids)}] {opportunity_id} -> UNEXPECTED ERROR: {type(e).__name__}: {e}")
 
     print(f"\nDone. dispatched={summary.get('dispatched', 0)} "
-          f"skipped={summary.get('skipped', 0)} errors={summary['errors']}")
+          f"skipped={summary.get('skipped', 0)} "
+          f"pending_review={summary.get('pending_review', 0)} errors={summary['errors']}")
     return summary
 
 
@@ -956,4 +1686,6 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    from db import init_db
+    init_db()
     run_batch(limit=args.limit)

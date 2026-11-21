@@ -20,7 +20,7 @@ const TITLES = {
 
 /** Polls /health so a dead backend is obvious before you read stale numbers. */
 function useHealth(pollMs = 20000) {
-  const [health, setHealth] = useState({ status: "checking", at: null });
+  const [health, setHealth] = useState({ status: "checking", at: null, dryRun: false });
 
   useEffect(() => {
     let cancelled = false;
@@ -29,7 +29,8 @@ function useHealth(pollMs = 20000) {
     const check = async () => {
       try {
         const res = await api.health();
-        if (!cancelled) setHealth({ status: "ok", at: res?.time ?? null });
+        // dry_run absent (older backend) is treated as live — never the reverse.
+        if (!cancelled) setHealth({ status: "ok", at: res?.time ?? null, dryRun: res?.dry_run === true });
       } catch {
         if (!cancelled) setHealth({ status: "down", at: null });
       }
@@ -103,6 +104,16 @@ export default function TopBar({ view, onOpenMenu, onRefresh, refreshedAt }) {
             Refresh
           </button>
         </div>
+
+        {health.dryRun ? (
+          <p
+            data-testid="dry-run-banner"
+            className="w-full basis-full rounded-md border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-800"
+          >
+            DRY RUN — simulation mode. Outbound messages and payment links are
+            logged, not sent or charged. No real customer contact is happening.
+          </p>
+        ) : null}
 
         {refreshedAt ? (
           <p className="w-full text-2xs text-ink-400 sm:w-auto sm:basis-full sm:text-right">

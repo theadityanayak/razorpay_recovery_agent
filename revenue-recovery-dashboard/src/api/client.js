@@ -1,13 +1,17 @@
 /**
  * Thin fetch wrapper over the FastAPI backend in main.py.
  *
- * Every endpoint is a read-only GET, so there is no auth, no mutation and no
- * cache invalidation to think about — the whole surface is here.
+ * Mostly read-only GETs, plus the three mutation endpoints the review queue
+ * needs (approve / reject / simulate is not called from the UI). Mutations
+ * send X-Admin-API-Key when VITE_ADMIN_API_KEY is set; with no key on either
+ * side, the backend only accepts them from loopback anyway.
  */
 
 export const API_BASE = (
   import.meta.env.VITE_API_BASE_URL || "http://localhost:8000"
 ).replace(/\/$/, "");
+
+const ADMIN_API_KEY = import.meta.env?.VITE_ADMIN_API_KEY || null;
 
 export class ApiError extends Error {
   constructor(message, { status = 0, detail = null, cause = null } = {}) {
@@ -29,12 +33,18 @@ export class ApiError extends Error {
   }
 }
 
-async function request(path, { signal } = {}) {
+async function request(path, { signal, method = "GET", body, admin = false } = {}) {
+  const headers = { Accept: "application/json" };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (admin && ADMIN_API_KEY) headers["X-Admin-API-Key"] = ADMIN_API_KEY;
+
   let res;
   try {
     res = await fetch(`${API_BASE}${path}`, {
+      method,
       signal,
-      headers: { Accept: "application/json" },
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
     });
   } catch (err) {
     if (err?.name === "AbortError") throw err;
@@ -113,10 +123,34 @@ export const api = {
     request(`/messages/${encodeURIComponent(decisionId)}`, opts),
 
   /**
-   * GET /stats/root-causes — NOT in the shipped main.py.
-   * Added by backend-patch.py. The root-cause chart calls this first and
-   * falls back to aggregating the feed client-side when it 404s, so the
-   * dashboard runs correctly against the unpatched backend.
+   * GET /stats/root-causes — full-table root-cause aggregation for the bar
+   * chart.
    */
   rootCauses: (opts) => request("/stats/root-causes", opts),
+
+  /** GET /stats/recovery — closed-loop recovered-revenue totals. */
+  recoveryStats: (opts) => request("/stats/recovery", opts),
+
+  /**
+   * POST /decisions/{id}/approve — approve a flagged decision and dispatch
+   * the parked message (DRY_RUN-aware on the backend).
+   */
+  approveDecision: (decisionId, opts) =>
+    request(`/decisions/${encodeURIComponent(decisionId)}/approve`, {
+      method: "POST",
+      admin: true,
+      ...opts,
+    }),
+
+  /**
+   * POST /decisions/{id}/reject — dismiss a flagged decision; no customer
+   * contact goes out. `reason` is recorded on the action's failure_reason.
+   */
+  rejectDecision: (decisionId, reason, opts) =>
+    request(`/decisions/${encodeURIComponent(decisionId)}/reject`, {
+      method: "POST",
+      admin: true,
+      body: { reason: reason || null },
+      ...opts,
+    }),
 };

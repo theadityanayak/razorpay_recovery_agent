@@ -169,6 +169,7 @@ const FLAGGED_DECISIONS = [
 /* ── Mock transport ──────────────────────────────────────────────────────── */
 
 const calls = [];
+const mutationCalls = [];
 // Toggled mid-run: proves both the empty-queue good-state AND the
 // populated queue with real flagged rows, in one test run.
 let reviewQueueMode = "empty";
@@ -182,11 +183,23 @@ function json(body, status = 200) {
   });
 }
 
-function mockFetch(url) {
+function mockFetch(url, opts = {}) {
   const path = String(url).replace(API, "");
-  calls.push(path);
+  const method = opts.method || "GET";
+  calls.push(`${method} ${path}`);
 
-  if (path.startsWith("/health")) return json({ status: "ok", time: new Date().toISOString() });
+  if (method === "POST" && path.endsWith("/approve")) {
+    const id = decodeURIComponent(path.split("/decisions/")[1].replace(/\/approve$/, ""));
+    mutationCalls.push(`approve:${id}`);
+    return json({ decision_id: id, status: "approved", dispatch: "scheduled", dry_run: true });
+  }
+  if (method === "POST" && path.endsWith("/reject")) {
+    const id = decodeURIComponent(path.split("/decisions/")[1].replace(/\/reject$/, ""));
+    mutationCalls.push(`reject:${id}`);
+    return json({ decision_id: id, status: "rejected" });
+  }
+
+  if (path.startsWith("/health")) return json({ status: "ok", time: new Date().toISOString(), dry_run: true });
   if (path.startsWith("/stats/root-causes")) return json({ detail: "Not Found" }, 404);
   if (path.startsWith("/stats/summary")) return json(STATS);
 
@@ -291,7 +304,10 @@ await build({
   // React must NOT be bundled: the test script imports react-dom/client
   // separately, and two copies of React in one tree breaks every hook.
   external: ["react", "react-dom", "react/jsx-runtime", "react-dom/client"],
-  define: { "import.meta.env.VITE_API_BASE_URL": JSON.stringify(API) },
+  define: {
+      "import.meta.env.VITE_API_BASE_URL": JSON.stringify(API),
+      "import.meta.env.VITE_ADMIN_API_KEY": JSON.stringify(""),
+    },
 });
 
 const appModule = await import(pathToFileURL(outFile).href);
@@ -327,7 +343,7 @@ function check(name, condition, detail = "") {
 }
 
 console.log("\nOverview");
-check("stats endpoint called", calls.some((c) => c.startsWith("/stats/summary")));
+check("stats endpoint called", calls.some((c) => c.endsWith("/stats/summary")));
 check("decision count rendered", text().includes("10,166"));
 check("dispatched count rendered", text().includes("3,428"));
 check("held count rendered", text().includes("3,659"));
@@ -350,7 +366,7 @@ check(
   "held outcome worded neutrally",
   pillText.includes("Held by guardrail") && !/fail|error|reject|denied/i.test(pillText)
 );
-check("root-cause aggregate falls back to sampling", calls.some((c) => c.startsWith("/stats/root-causes")));
+check("root-cause aggregate falls back to sampling", calls.some((c) => c.includes("/stats/root-causes")));
 check("root cause labels humanised", text().includes("Subscription failure"));
 check("donut contact rate rendered", text().includes("48.4%"));
 
@@ -358,6 +374,8 @@ console.log("\nFeed");
 check("merchant rows rendered", text().includes("VikalpCloud") && text().includes("ShikshaDirect"));
 check("outcome vocabulary used", text().includes("Message sent") && text().includes("Held by guardrail"));
 check("undecided row reads as queued", text().includes("Awaiting triage"));
+check("estimated recovery computed from live stats, labelled as an assumption", text().includes("Estimated recovery (assumes 60%): ₹14.69 Cr"));
+check("dry-run banner shown when API reports simulation mode", text().includes("DRY RUN — simulation mode"));
 check("INR grouping on row amounts", text().includes("₹17,318.68"));
 
 console.log("\nExpanding a dispatched row");
@@ -367,7 +385,7 @@ await act(async () => {
 });
 await settle(200);
 
-check("decision index built from /decisions", calls.some((c) => c.startsWith("/decisions?")));
+check("decision index built from /decisions", calls.some((c) => c.includes("/decisions?")));
 check("pipeline stages rendered", text().includes("Guardrail") && text().includes("Dispatch"));
 check("chosen action humanised", text().includes("Ask for mandate re-authorisation"));
 check("reasoning summary shown", text().includes("policy_check=passed"));
@@ -458,6 +476,48 @@ check(
   "judgement-call flag does NOT get the data-problem explanation",
   !text().includes("a customer or merchant reference on this opportunity points at nothing")
 );
+
+// Row 2 is still open: approve it. The row must leave the queue optimistically
+// and the backend must receive POST /decisions/{id}/approve.
+const approveBtn = [...document.querySelectorAll("button")].find((b) =>
+  (b.textContent || "").includes("Approve & send")
+);
+check("approve button rendered on flagged row", !!approveBtn);
+await act(async () => {
+  approveBtn?.click();
+});
+await settle(150);
+check(
+  "approve POSTed to the backend",
+  mutationCalls.some((c) => c === "approve:flag0002-judg-emen-tcal-l00000000002")
+);
+check(
+  "approved row left the queue optimistically",
+  !text().includes("EduVriksha Learning") && text().includes("GhostMerchant")
+);
+
+// Row 1 remains: dismiss it.
+const reviewRowButtonsAfter = () =>
+  [...document.querySelectorAll("button[aria-expanded]")].filter((b) =>
+    (b.getAttribute("aria-controls") || "").startsWith("review-")
+  );
+await act(async () => {
+  reviewRowButtonsAfter()[0]?.click();
+});
+await settle(150);
+const dismissBtn = [...document.querySelectorAll("button")].find((b) =>
+  (b.textContent || "").trim().startsWith("Dismiss")
+);
+check("dismiss button rendered on flagged row", !!dismissBtn);
+await act(async () => {
+  dismissBtn?.click();
+});
+await settle(150);
+check(
+  "reject POSTed to the backend",
+  mutationCalls.some((c) => c === "reject:flag0001-int3-grty-erro-r00000000001")
+);
+check("queue back to the good empty state", text().includes("Nothing needs review"));
 
 /* ── Result ──────────────────────────────────────────────────────────────── */
 
