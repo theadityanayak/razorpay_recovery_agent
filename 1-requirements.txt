@@ -1,0 +1,12 @@
+# Pinned backend dependencies — install with: pip install -r requirements.txt
+fastapi==0.162.5
+uvicorn[standard]==0.54.0
+pydantic==2.14.4
+pydantic-settings==2.15.0
+langgraph==1.2.24
+langchain-core==1.7.7
+langchain-google-genai==4.4.3
+razorpay==2.0.1
+twilio==9.13.0
+resend==2.55.0
+httpx==0.28.1
